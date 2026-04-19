@@ -45,7 +45,12 @@ try:
 except ImportError:
     _YAML_AVAILABLE = False
 
-GLASS_DIR = Path("/home/madrid/Desktop/GLASS")
+# Repo root — `simulator/datasets.py` → parent = simulator/, then parent = repo root.
+# Derived at import time so the module is portable across checkouts.
+# Override at runtime with: `os.environ["GLASS_ROOT"] = "/path"` before import,
+# or by assigning to `simulator.datasets.GLASS_DIR` after import.
+import os
+GLASS_DIR = Path(os.environ.get("GLASS_ROOT", Path(__file__).resolve().parents[1]))
 
 
 @dataclass
