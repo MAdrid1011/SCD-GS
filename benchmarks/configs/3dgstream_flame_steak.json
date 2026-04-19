@@ -1,0 +1,22 @@
+{
+  "model_path":  "data/assets/3DGStream/flame_steak_suite/flame_steak_init",
+  "output_path": "results/3DGStream/flame_steak/output",
+  "video_path":  "data/3dgstream_flame_steak_scene",
+  "images": "images",
+  "iterations": 150,
+  "iterations_s2": 100,
+  "first_load_iteration": 15000,
+  "ntc_lr": 0.002,
+  "ntc_conf_path": "configs/cache/cache_F_4.json",
+  "ntc_path": "ntc/flame_steak_ntc_params_F_4.pth",
+  "only_mlp": false,
+  "frame_start": 1,
+  "frame_end": 5,
+  "load_iteration": 150,
+  "test_iterations": [150],
+  "save_iterations": [150],
+  "checkpoint_iterations": [],
+  "eval": true,
+  "sh_degree": 1,
+  "_comment": "All *_path fields are RELATIVE TO THE REPO ROOT.  The caller (bench_3dgstream.{py,sh}) expands them against the resolved repo root before passing to 3DGStream, so the JSON stays portable across checkouts."
+}

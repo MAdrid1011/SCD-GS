@@ -1,0 +1,66 @@
+# =============================================================================
+# GLASS Baseline Benchmark Configuration
+# Dataset: N3DV flame_steak scene
+#
+# All paths below are RELATIVE to the repository root.
+# They are resolved at runtime by benchmarks/scripts/*.py (see _repo_root()).
+#
+# User-provided data lives under data/ (gitignored) and data/assets/
+# (gitignored, but expected to exist locally — see benchmarks/README.md
+# for the directory layout and how to populate it).
+# =============================================================================
+
+dataset:
+  name: flame_steak
+  # Raw N3DV frames (unpacked videos + COLMAP).  User-supplied; not in git.
+  root: data/flame_steak/flame_steak
+  n_frames: 300
+  n_cams: 21
+  smoke_frames: 10            # quick smoke-test subset
+
+methods:
+  3DGStream:
+    conda_env: 3dgstream-cu121
+    repo: baselines/3DGStream
+    # 3DGS init model trained on frame 0 (the "static" base model).
+    # Produced by the upstream 3DGStream preprocessing pipeline; see
+    # benchmarks/README.md §"Assets" for how to regenerate.
+    init_3dgs: data/assets/3DGStream/flame_steak_suite/flame_steak_init
+    # Per-frame COLMAP output for frame 0 (images + sparse + distorted).
+    frame000:  data/assets/3DGStream/flame_steak_suite/frame000000
+    # Per-frame COLMAP output for all 300 frames (used as video_path).
+    video_path: data/3dgstream_flame_steak_scene
+    output_dir: results/3DGStream
+
+  QUEEN:
+    conda_env: queen-cu121
+    repo: baselines/QUEEN
+    output_dir: results/QUEEN
+    # Minimal subset of a completed QUEEN training run used for quality
+    # + FPS reference metrics (see benchmarks/scripts/bench_queen.py).
+    # Contains: {avg,training,per_frame,cameras,results}_metrics.json,
+    # cfg_args, and the last trained frame's point_cloud.ply.
+    prior_run: data/assets/QUEEN/flame_steak_prior
+
+  Swift4D:
+    conda_env: queen-cu121   # Swift4D shares the queen env (same CUDA/PyTorch)
+    repo: baselines/Swift4D
+    output_dir: results/Swift4D
+
+  HiCoM:
+    conda_env: hicom-cu121
+    repo: baselines/HiCoM
+    output_dir: results/HiCoM
+    # HiCoM uses a pre-processed variant of the scene (different layout
+    # than raw N3DV); user-supplied under data/ (see benchmarks/README.md).
+    data_root: data/hicom_flame_steak_scene
+
+metrics:
+  - train_sec_per_frame        # incremental training (excludes frame-0 init)
+  - render_fps
+  - psnr_db
+  - ssim
+  - lpips
+  - init_model_mb              # frame-0 / base model size
+  - incremental_mb_per_frame   # per-frame delta size (avg)
+  - total_mb                   # total storage across all frames
