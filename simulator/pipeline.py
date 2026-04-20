@@ -91,6 +91,10 @@ class GLASSPipeline:
         # Suppression ratio from the previous frame, used by the adaptive NTC
         # training scheduler: mode >= 1 uses this to scale down n_ntc_iters.
         # Initialised to 0.0 so frame 0 always runs the full iteration count.
+        # Kept for backwards compatibility with 3DGStream's per-call NTC ratio
+        # update path; new baselines (QUEEN / HiCoM) should call
+        # :meth:`current_frame_suppression_ratio` which covers the dict and
+        # fast paths uniformly via the ``_feedback_*_bytes`` accumulators.
         self._prev_suppression_ratio: float = 0.0
 
         # Render stats captured from the previous frame's inference render_pkg.
@@ -110,7 +114,56 @@ class GLASSPipeline:
         self._frame_suppressed_bytes: int = 0
         self._frame_unique_targets:   int = 0
 
+        # Per-frame feedback accumulators — separate from stream_stats caches
+        # so that 3DGStream (which takes the ingest_ntc_deltas route) and
+        # HiCoM/QUEEN (which take the pre_optimizer_step route) can both
+        # contribute to the same scalar signal for the adaptive threshold
+        # controller without interfering with stream_stats semantics.
+        self._feedback_total_bytes:      int = 0
+        self._feedback_suppressed_bytes: int = 0
+
+        # ── Auto-structural UCN detector (cfg.auto_structural_ucn) ────────────
+        # Observes the training cadence during frame 1 and lazily switches
+        # ``cfg.frame_level_ucn`` / ``cfg.reset_cwb_each_frame`` before frame
+        # 2 starts.  This avoids per-baseline hand-tuning: HiCoM (dense
+        # per-iter Adam) ends up with frame-level UCN, 3DGStream (NTC
+        # ingest path) stays iteration-level.
+        # Captured initial config (user overrides are always respected).
+        self._user_frame_level_ucn:    bool = bool(config.frame_level_ucn)
+        self._user_reset_cwb:          bool = bool(config.reset_cwb_each_frame)
+        # Per-frame instrumentation — updated by pre_optimizer_step.
+        self._steps_this_frame:        int = 0
+        self._first_opt_param_id:      int | None = None
+        # Stored from the previous frame for the decision in begin_frame().
+        self._prev_frame_step_count:   int = 0
+        self._prev_first_opt_param_id: int | None = None
+        self._optimizer_id_changed:    bool = False
+        # One-shot decision gate.
+        self._auto_structural_decided: bool = False
+
     # ── Frame lifecycle ────────────────────────────────────────────────────────
+
+    def current_frame_suppression_ratio(self) -> float:
+        """Suppression ratio observed over the most recently completed frame.
+
+        Reads the per-byte feedback accumulators populated by the dict
+        path, the fast path, and ``ingest_ntc_deltas`` — so every baseline
+        sees the same signal.  Returns 0.0 for frame 0 (no history yet).
+
+        Must be called BEFORE :meth:`begin_frame` on the next frame, since
+        ``begin_frame`` consumes the accumulators for the feedback
+        controller and then resets them to 0.  This matches the scheduler
+        usage pattern already established by ``run_3dgstream.py`` where
+        ``pipeline._prev_suppression_ratio`` is read before ``begin_frame``.
+
+        Falls back to the legacy ``_prev_suppression_ratio`` attribute if
+        the accumulators are empty (e.g. the previous frame's NTC path
+        updated the legacy attribute but the feedback accumulators were
+        reset before the scheduler call).
+        """
+        if self._feedback_total_bytes > 0:
+            return self._feedback_suppressed_bytes / self._feedback_total_bytes
+        return self._prev_suppression_ratio
 
     def begin_frame(self) -> None:
         """Advance the frame counter and reset per-frame state.
@@ -124,7 +177,75 @@ class GLASSPipeline:
         This is appropriate for baselines that re-initialise their optimiser
         at every frame (e.g. QUEEN); NTC-based models leave it False so that
         temporal stability detection spans multiple frames.
+
+        Two self-adaptive hooks run here before the structural reset:
+        * Auto-structural UCN decision (first frame boundary only): picks
+          frame-level vs iteration-level UCN based on frame 1's observed
+          cadence (see ``cfg.auto_structural_ucn``).
+        * Feedback threshold update: pushes
+          ``consolidation._effective_threshold`` toward
+          ``cfg.adaptive_ucn_target_ratio`` using the PREVIOUS frame's
+          suppression ratio.  No-op for frame 1 (no history yet).
         """
+        # ── Roll over per-frame instrumentation samples ───────────────────────
+        # Must happen FIRST so the structural detector below reads the
+        # just-finished frame's step count and optimizer-id (not the next
+        # frame's zeroed state).
+        prev_step_count = self._steps_this_frame
+        if (
+            self._first_opt_param_id is not None
+            and self._prev_first_opt_param_id is not None
+            and self._first_opt_param_id != self._prev_first_opt_param_id
+        ):
+            self._optimizer_id_changed = True
+        self._prev_first_opt_param_id = self._first_opt_param_id
+        self._prev_frame_step_count   = prev_step_count
+        self._steps_this_frame        = 0
+        self._first_opt_param_id      = None
+
+        # ── Auto-structural UCN decision ──────────────────────────────────────
+        # Done exactly once, at the start of frame 2, using the cadence
+        # observed during frame 1.  Any explicit user override recorded in
+        # ``_user_frame_level_ucn`` / ``_user_reset_cwb`` is preserved.
+        if (
+            self.cfg.auto_structural_ucn
+            and not self._auto_structural_decided
+            and self._version >= 1
+        ):
+            # Ran at least one full frame already (version was incremented
+            # to 1 on its begin_frame()); decide now before frame 2 begins.
+            dense_iter = (
+                prev_step_count
+                >= int(self.cfg.auto_structural_step_threshold)
+            )
+            opt_changed = self._optimizer_id_changed
+            if dense_iter and not self._user_frame_level_ucn:
+                # Switch to frame-level UCN. The pre-existing iteration-level
+                # CWB entries pushed during frame 1 are not meaningful cross-
+                # frame history; discard them so the new regime starts clean.
+                self.cfg.frame_level_ucn = True
+                self.consolidation.cwb.clear()
+                self.consolidation.cwb_batched.clear()
+                self.consolidation._frame_accum.clear()
+                # Reset feedback controller so the lazy switch doesn't inherit
+                # the frame-1 threshold drift from the wrong operating regime.
+                # Re-initialise exactly like ConsolidationUnit.__init__ would:
+                # start permissive when adaptive control is on so UCN doesn't
+                # over-suppress frame 2 while the feedback loop re-converges.
+                if self.cfg.adaptive_ucn_threshold:
+                    self.consolidation._effective_threshold = float(
+                        self.cfg.adaptive_ucn_threshold_max
+                    )
+                else:
+                    self.consolidation._effective_threshold = float(
+                        self.cfg.merge_cos_threshold
+                    )
+            if opt_changed and not self._user_reset_cwb:
+                # Per-frame optimizer rebuild → stale CWB entries reference
+                # retired parameter tensors; force CWB reset each frame.
+                self.cfg.reset_cwb_each_frame = True
+            self._auto_structural_decided = True
+
         self._version += 1
         self._stream = UpdateStream()
         self.fabric.reset_frame_deltas()
@@ -139,6 +260,31 @@ class GLASSPipeline:
         elif self.cfg.reset_cwb_each_frame:
             self.consolidation.cwb.clear()
             self.consolidation.cwb_batched.clear()
+
+        # ── Feedback threshold update (cfg.adaptive_ucn_threshold) ────────────
+        # Uses the PREVIOUS frame's per-byte suppression ratio (accumulated
+        # during the just-finished frame in ``_feedback_total_bytes`` /
+        # ``_feedback_suppressed_bytes`` by both the pre_optimizer_step
+        # route and the ingest_ntc_deltas route) to nudge
+        # ``consolidation._effective_threshold`` toward the target ratio.
+        # Runs after the one-shot structural decision above so the first
+        # update uses the correct regime's ratio.  No-op when adaptive
+        # control is off, in mode 0 (UCN off), or when there's no history.
+        if self._version >= 1 and self._feedback_total_bytes > 0:
+            observed = (
+                self._feedback_suppressed_bytes / self._feedback_total_bytes
+            )
+            if self.cfg.adaptive_ucn_threshold and self.cfg.mode >= 1:
+                self.consolidation.update_effective_threshold(observed)
+            # Persist the bytes-based ratio as the canonical fallback.
+            # Runners that already read the legacy attribute (e.g. run_3dgstream)
+            # see a consistent value across paths; new runners should prefer
+            # :meth:`current_frame_suppression_ratio` which handles the case
+            # where the accumulators were already reset.
+            self._prev_suppression_ratio = observed
+        # Reset feedback-only accumulators for the next frame.
+        self._feedback_total_bytes      = 0
+        self._feedback_suppressed_bytes = 0
 
         # ILSF tier sort fires once per frame; it operates on a disjoint memory
         # region and completes well within one ICE step, so it is hidden by the
@@ -433,9 +579,18 @@ class GLASSPipeline:
             self._cycles.add_ice_merged(N - n_cold, n_cold, total_d)
 
         # ILSF update: record hotness only for new NTC descriptors.
+        # UCN-suppressed descriptors (grad_scale == 0) go through
+        # record_ucn_suppression so the fabric tracks stability streaks
+        # and eventually lets hotness decay via EMA — this is how UCN's
+        # per-frame stability signal turns into Mode ≥ 2 render-mask
+        # savings (ucn_drive_fabric_demotion in ASICConfig).
         n_updated = 0
         for d in self._stream.descriptors[_len_before:]:
-            if d.target_id >= 0 and d.delta_norm > 0.0:
+            if d.target_id < 0 or d.delta_norm <= 0.0:
+                continue
+            if d.grad_scale <= 0.0:
+                self.fabric.record_ucn_suppression(d.target_id)
+            else:
                 self.fabric.record_update(d.target_id, d.delta_norm)
                 n_updated += 1
         self._cycles.add_ilsf_update(n_updated)
@@ -456,11 +611,21 @@ class GLASSPipeline:
         # Run-level traffic stats: accumulate only the NTC descriptors added
         # in this call (snapshot approach avoids double-counting with
         # pre_optimizer_step which runs separately for added Gaussians).
-        _ntc_descs = self._stream.descriptors[_len_before:]
-        self._total_bytes_all      += sum(d.delta_bytes() for d in _ntc_descs)
-        self._suppressed_bytes_all += sum(
+        _ntc_descs      = self._stream.descriptors[_len_before:]
+        _ntc_total_b    = sum(d.delta_bytes() for d in _ntc_descs)
+        _ntc_supp_b     = sum(
             d.delta_bytes() for d in _ntc_descs if d.grad_scale < 1.0
         )
+        self._total_bytes_all      += _ntc_total_b
+        self._suppressed_bytes_all += _ntc_supp_b
+        # Feed NTC byte traffic into the adaptive-threshold feedback
+        # accumulators so the controller in begin_frame() sees a
+        # non-zero suppression ratio for NTC-route baselines (3DGStream).
+        # Kept separate from ``_frame_total_bytes`` / ``_frame_suppressed_bytes``
+        # (which drive the stream_stats cache branch) to avoid swapping
+        # the unique-target count cache from stream.unique_targets() to 0.
+        self._feedback_total_bytes      += _ntc_total_b
+        self._feedback_suppressed_bytes += _ntc_supp_b
 
     # ── Main training hook ────────────────────────────────────────────────────
 
@@ -479,6 +644,20 @@ class GLASSPipeline:
         optimizer      : the model's optimizer
         struct_changed : Gaussian IDs that changed structurally this step
         """
+        # Structural-detector probe: count steps per frame and sample the
+        # first-param id of the first group.  Used by begin_frame() to pick
+        # frame_level_ucn / reset_cwb_each_frame automatically before frame
+        # 2 starts.  Cheap: one int increment and one conditional read.
+        if self.cfg.auto_structural_ucn and not self._auto_structural_decided:
+            self._steps_this_frame += 1
+            if self._first_opt_param_id is None:
+                try:
+                    g0 = optimizer.param_groups[0]
+                    p0 = g0["params"][0]
+                    self._first_opt_param_id = id(p0)
+                except Exception:
+                    self._first_opt_param_id = -1
+
         # Fast path for mode 0 (base ASIC): avoid building Python descriptor
         # objects for every (Gaussian, attr) pair; keep cycle/byte accounting
         # identical while using vectorized tensor reductions only.
@@ -504,7 +683,6 @@ class GLASSPipeline:
         #              (no structural changes → empty set).
         if (
             self.cfg.mode in (1, 2, 3)
-            and not self.cfg.adaptive_ucn_threshold
             and struct_changed is None
             # The fast path's unifier between main (batched CWB) and
             # fallback (dict-loop) CWB history only has a precise
@@ -512,6 +690,10 @@ class GLASSPipeline:
             # (3DGStream / NTC baselines) never invokes this code path —
             # they take the ingest_ntc_deltas() route — so restricting to
             # frame_level_ucn keeps the fast path narrow and exact.
+            # (adaptive_ucn_threshold now routes through
+            # ``ConsolidationUnit.get_effective_threshold``; both paths
+            # read the same controlled scalar so the fast path stays
+            # bit-equivalent to the dict path under feedback control.)
             and self.cfg.frame_level_ucn
         ):
             self._pre_optimizer_step_mode1_fast(optimizer)
@@ -537,9 +719,17 @@ class GLASSPipeline:
         # added by THIS call only (_new_descs).  NTC descriptors were already
         # processed by ingest_ntc_deltas(); re-scanning the full stream here
         # would iterate 280K items × 100 steps/frame = 28M Python ops/frame.
+        # UCN-suppressed descriptors (grad_scale == 0) feed the fabric's
+        # demotion streak instead of adding a hotness reward, so long-term
+        # stable Gaussians eventually drop into CSS and stop consuming
+        # render cycles in Mode ≥ 2 (ucn_drive_fabric_demotion).
         n_updated = 0
         for d in self._stream.descriptors[_len_before:]:
-            if d.target_id >= 0 and d.delta_norm > 0.0:
+            if d.target_id < 0 or d.delta_norm <= 0.0:
+                continue
+            if d.grad_scale <= 0.0:
+                self.fabric.record_ucn_suppression(d.target_id)
+            else:
                 self.fabric.record_update(d.target_id, d.delta_norm)
                 n_updated += 1
         self._cycles.add_ilsf_update(n_updated)
@@ -584,10 +774,17 @@ class GLASSPipeline:
         # only (snapshot approach: slice from _len_before to avoid counting NTC
         # descriptors added earlier by ingest_ntc_deltas in the same frame).
         _new_descs = self._stream.descriptors[_len_before:]
-        self._total_bytes_all      += sum(d.delta_bytes() for d in _new_descs)
-        self._suppressed_bytes_all += sum(
+        _new_total_b = sum(d.delta_bytes() for d in _new_descs)
+        _new_supp_b  = sum(
             d.delta_bytes() for d in _new_descs if d.grad_scale < 1.0
         )
+        self._total_bytes_all      += _new_total_b
+        self._suppressed_bytes_all += _new_supp_b
+        # Adaptive-threshold feedback accumulators (kept separate from
+        # stream_stats's per-frame caches — see the feedback comment in
+        # ingest_ntc_deltas() and __init__).
+        self._feedback_total_bytes      += _new_total_b
+        self._feedback_suppressed_bytes += _new_supp_b
 
     def _pre_optimizer_step_mode0_fast(self, optimizer: object) -> None:
         """Mode-0 fast path without per-Gaussian Python descriptors.
@@ -681,6 +878,18 @@ class GLASSPipeline:
             so its only observable effect would be a dict write of
             ``_recent_delta`` / ``_hotness`` that nothing reads.  Skipping
             it removes the last per-gid Python loop on this critical path.
+            In mode >= 2 fabric hotness IS read, but hotness ordering for
+            QUEEN in the fast path is driven by ``fabric.record_render``
+            (called from ``post_render``), not by gradient events — so the
+            mask is still well-formed without a per-step ``record_update``.
+          - ``fabric.record_ucn_suppression`` is similarly not called.
+            The UCN→demotion path (``ucn_drive_fabric_demotion``) requires
+            per-gid per-step suppression tracking; on QUEEN's 188 K ×
+            150-step frames that would mean a 28 M-entry tensor flush,
+            too costly for a per-step hot path.  Path 1 (UCN→fabric) is
+            therefore active only on the dict / NTC-ingest paths (HiCoM,
+            3DGStream); QUEEN relies on Path 2 (UCN→iter scheduler) for
+            its Mode ≥ 1 savings.
           - Structural-change salience bookkeeping is not performed (mode
             >= 3 only).
         """
@@ -1039,6 +1248,11 @@ class GLASSPipeline:
         )
         self._total_bytes_all      += total_bytes_step
         self._suppressed_bytes_all += suppressed_bytes_step
+        # Mirror into the adaptive-threshold feedback accumulators so the
+        # fast path participates in the same per-frame feedback signal
+        # as the dict path and the NTC path.
+        self._feedback_total_bytes      += total_bytes_step
+        self._feedback_suppressed_bytes += suppressed_bytes_step
 
     def _mode1_dict_fallback(
         self, groups: list
@@ -1234,6 +1448,16 @@ class GLASSPipeline:
                     opacity = self.slot.get_gaussians().get_opacity.squeeze(-1)
                 except Exception:
                     opacity = torch.ones(radii.shape[0], device=radii.device)
+            # HiCoM's merged rasteriser emits ``radii`` over base + incremental
+            # Gaussians, but the slot's accessor may return only the base row
+            # count when incr attributes are not yet registered (transient
+            # state between stage 1 / stage 2 transitions).  Fall back to a
+            # neutral ones-vector whenever the shapes disagree so salience
+            # never sees a ragged (op, r) pair — salience treats it as "no
+            # opacity modulation", equivalent to the explicit fallback path
+            # above for baselines that never expose ``get_opacity``.
+            if opacity.shape[0] != radii.shape[0]:
+                opacity = torch.ones(radii.shape[0], device=radii.device)
             self.salience.update(radii, opacity)
             # Salience cycles run in parallel with ILSF_render above.
             self._cycles.add_salience(radii.shape[0])
@@ -1492,3 +1716,21 @@ class GLASSPipeline:
         self._frame_total_bytes = 0
         self._frame_suppressed_bytes = 0
         self._frame_unique_targets = 0
+        self._feedback_total_bytes      = 0
+        self._feedback_suppressed_bytes = 0
+        # Reset structural detector + effective threshold so a fresh run
+        # on the same pipeline instance starts from a clean slate.
+        self._steps_this_frame        = 0
+        self._first_opt_param_id      = None
+        self._prev_frame_step_count   = 0
+        self._prev_first_opt_param_id = None
+        self._optimizer_id_changed    = False
+        self._auto_structural_decided = False
+        if self.cfg.adaptive_ucn_threshold:
+            self.consolidation._effective_threshold = float(
+                self.cfg.adaptive_ucn_threshold_max
+            )
+        else:
+            self.consolidation._effective_threshold = float(
+                self.cfg.merge_cos_threshold
+            )

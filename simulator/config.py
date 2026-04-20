@@ -47,23 +47,104 @@ class ASICConfig:
     considered temporally stable and gets folded (scaled down).
     Range [0, 1]; higher = more aggressive suppression."""
 
-    adaptive_ucn_threshold: bool = False
-    """If True, scales merge_cos_threshold upward when the CWB history shows
-    high gradient-norm variance (coefficient of variation), indicating the
-    model is still actively learning and should not be suppressed.
+    adaptive_ucn_threshold: bool = True
+    """If True, enables the **feedback-based threshold controller**.  The
+    effective UCN threshold is updated once per frame based on the observed
+    per-frame suppression ratio:
 
-    Effective threshold = merge_cos_threshold + CV_clamped * (1 − merge_cos_threshold)
+        err = observed_ratio − adaptive_ucn_target_ratio
+        effective_threshold ← clip(
+            effective_threshold + adaptive_ucn_kp · err,
+            adaptive_ucn_threshold_min, adaptive_ucn_threshold_max
+        )
 
-    where CV = std(CWB_norms) / mean(CWB_norms), clamped to [0, 1].
+    Rationale
+    ---------
+    A static merge_cos_threshold cannot work well for every baseline:
+      * 3DGStream (NTC path)      → wants high suppression to skip redundant
+        NTC iters.
+      * QUEEN (frame-level UCN)   → wants moderate suppression; dynamic
+        Gaussians must survive.
+      * HiCoM (iteration-level,   → at 0.90 the default over-suppresses and
+        dense per-iter Adam)         kills 99.5 % of updates → quality crash.
 
-    When CV → 1 (high variance, e.g. intermittently visible Gaussians or
-    rapid learning): effective_threshold → 1.0 → nothing suppressed.
-    When CV → 0 (stable norms, converged): effective_threshold = merge_cos_threshold.
+    A feedback loop automatically finds the right threshold for each
+    baseline's gradient landscape: when too many Gaussians are being
+    suppressed, the threshold rises (harder to suppress); when too few,
+    it falls.
 
-    Recommended for compact-Gaussian baselines (QUEEN, HiCoM) where the
-    default 0.90 threshold over-suppresses the small number of active updates.
-    Leave False for NTC-based models (3DGStream) which rely on cross-frame
-    stability as the suppression signal."""
+    Hardware cost
+    -------------
+    One frame-level 16-bit register + 1 mul + 1 add + 1 clamp per frame —
+    area / cycle overhead is negligible versus the UCN comparator array
+    itself.  The per-step UCN gate is unchanged — only the scalar threshold
+    it reads moves slowly across frames.
+
+    Back-compat: set to ``False`` to freeze the threshold at
+    ``merge_cos_threshold`` for every frame (original fixed-threshold
+    behaviour).  The legacy per-Gaussian coefficient-of-variation formula
+    has been retired — it never triggered in practice because Adam's
+    post-warmup gradient norms are stable and CV stays ≈ 0."""
+
+    adaptive_ucn_target_ratio: float = 0.70
+    """Target per-frame suppression ratio used by the feedback threshold
+    controller.  Default 0.70 keeps 30 % of updates live on average — a
+    good trade-off between compute savings and training quality across
+    all supported baselines.  Out of range [0, 1] → disabled check."""
+
+    adaptive_ucn_kp: float = 0.30
+    """Proportional gain for the feedback loop.  Smaller → slower
+    convergence but smoother threshold trajectory (less frame-to-frame
+    jitter).  0.30 yields ≈ 3-5 frames to converge from the initial
+    threshold to steady state for typical error magnitudes — matched to
+    the 10-frame ablation budget so the feedback loop has enough headroom
+    to settle before the metrics window closes.  The static clamps
+    ``adaptive_ucn_threshold_min`` / ``_max`` cap any overshoot."""
+
+    adaptive_ucn_threshold_min: float = 0.80
+    """Lower clamp on the feedback-controlled effective threshold.  Below
+    this value UCN becomes too permissive and stops saving cycles; at
+    0.80, ≥ 20 % magnitude mismatch is required to treat a gradient as
+    novel."""
+
+    adaptive_ucn_threshold_max: float = 1.0
+    """Upper clamp on the feedback-controlled effective threshold.
+
+    At ``threshold = 1.0`` the comparator ``sim > threshold`` is always
+    false (sim ∈ [0, 1]), which means UCN suppresses nothing — an
+    effective "UCN off" state that the feedback loop can reach when the
+    baseline's gradient-norm distribution has sim values clustered
+    close to 1.0 (HiCoM frame-level: Adam convergence keeps frame-mean
+    norms almost identical across frames, so sim routinely > 0.99).
+    Clamping lower (e.g. 0.995) would trap the threshold below the
+    cluster and leave suppression pinned at the ceiling — the bug that
+    motivated this controller."""
+
+    auto_structural_ucn: bool = True
+    """If True, GLASSPipeline auto-detects the UCN operating regime from
+    the observed training cadence and switches ``frame_level_ucn`` and
+    ``reset_cwb_each_frame`` appropriately at the start of frame 2.
+
+    Detection heuristics
+    --------------------
+    * ``pre_optimizer_step`` count per frame ≥ ``auto_structural_step_threshold``
+      → dense per-iteration Adam training (HiCoM stage-2, QUEEN temporal
+      residual) → switch to ``frame_level_ucn=True`` so the CWB doesn't
+      over-suppress within a single frame's Adam warm-up.
+    * The first-parameter id in ``optimizer.param_groups`` changes across
+      frames → the baseline re-creates its optimizer each frame (QUEEN,
+      HiCoM gaussians_incr) → set ``reset_cwb_each_frame=True`` so stale
+      history from the retired optimizer doesn't bleed into the next
+      frame's decisions.
+
+    Both toggles are one-shot: the decision is frozen after frame 2.
+    Explicit user overrides (passing ``frame_level_ucn=True`` in the
+    runner) are respected and never overwritten."""
+
+    auto_structural_step_threshold: int = 20
+    """Minimum number of ``pre_optimizer_step`` calls in frame 1 required
+    to switch into frame-level UCN.  20 comfortably separates dense Adam
+    training (100+ steps/frame) from NTC-style single-step frames."""
 
     reset_cwb_each_frame: bool = False
     """If True, the Correlation Window Buffer is cleared at the start of every
@@ -147,6 +228,33 @@ class ASICConfig:
     hotness_render_reward: float = 0.4
     """Hotness score increment added when a Gaussian is visible (in
     visibility_filter) this frame."""
+
+    ucn_drive_fabric_demotion: bool = True
+    """Enable UCN→Fabric demotion signal (Path 1 of UCN generalisation).
+
+    When enabled, every ``pre_optimizer_step`` / ``ingest_ntc_deltas`` call
+    reports per-Gaussian UCN suppression events to the fabric.  A Gaussian
+    that has been UCN-suppressed for ``ucn_demotion_streak`` consecutive
+    frames is considered "temporally stable" and stops receiving the
+    hotness reward from new gradient events — its hotness then decays
+    naturally via the EMA, and it eventually falls below both the ASC and
+    RSB hotness cuts and enters the CSS tier.  CSS Gaussians are excluded
+    from the Mode ≥ 2 render mask, so this signal turns UCN's per-frame
+    stability judgement into **physical render+backward savings** for
+    baselines whose optimizer itself is cheap (e.g. HiCoM hard-freezing).
+    Streaks are reset the moment a Gaussian again receives a
+    non-suppressed gradient, so dynamic Gaussians never get stranded in
+    CSS — the quality floor is the usual ``asb_capacity + rsb_capacity``
+    hot-tier guarantee.  Set to False to restore legacy behaviour where
+    fabric hotness depends only on gradient-event presence.
+    """
+
+    ucn_demotion_streak: int = 3
+    """Consecutive UCN-suppressed frames required before the fabric stops
+    rewarding a Gaussian's hotness on the next gradient event.  3 is a
+    safe default: below the 10-frame ablation window so demotion has
+    room to kick in, but high enough that a one-off suppression on a
+    noisy frame does not evict a Gaussian from the hot tier."""
 
     # ── Stage 4: Salience-First Render Issue ─────────────────────────────────
     salience_ema_alpha: float = 0.80

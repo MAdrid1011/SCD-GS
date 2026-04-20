@@ -62,6 +62,13 @@ class LiveStateFabric:
         # Cached mask from last get_render_mask() call
         self._cached_mask: torch.BoolTensor | None = None
         self._cached_n: int = 0
+        # UCN-demotion streak: per-Gaussian count of consecutive frames in
+        # which UCN suppressed this Gaussian.  Populated by record_ucn_
+        # suppression(); reset to 0 by record_update when a non-suppressed
+        # gradient event arrives.  Consumed inside record_update to decide
+        # whether the hotness reward is applied (streak < threshold) or
+        # skipped (streak ≥ threshold — let hotness decay via EMA).
+        self._ucn_streak: dict[int, int] = {}
 
     # ── Score updates ─────────────────────────────────────────────────────────
 
@@ -69,14 +76,49 @@ class LiveStateFabric:
         """Update hotness for a Gaussian that received a gradient this frame.
 
         Also records the delta_norm for the RSB threshold check.
+
+        If ``ucn_drive_fabric_demotion`` is enabled and the Gaussian's UCN
+        suppression streak has reached ``ucn_demotion_streak``, the
+        hotness reward is skipped (hotness decays by the EMA alpha only).
+        Either way — reward applied or not — reaching this function means
+        a non-suppressed gradient arrived, so the streak is reset to 0.
         """
         alpha = self.cfg.hotness_alpha
-        reward = self.cfg.hotness_update_reward
         old = self._hotness.get(gid, 0.0)
-        self._hotness[gid] = alpha * old + (1.0 - alpha) * reward
+        if (
+            self.cfg.ucn_drive_fabric_demotion
+            and self._ucn_streak.get(gid, 0) >= self.cfg.ucn_demotion_streak
+        ):
+            # Long-suppressed Gaussian just came back; decay-only this step
+            # (no reward injection) so it has to earn its way back into the
+            # hot tier over a few frames of sustained activity.  This damps
+            # one-off noise and keeps hotness ordering stable.
+            self._hotness[gid] = alpha * old
+        else:
+            reward = self.cfg.hotness_update_reward
+            self._hotness[gid] = alpha * old + (1.0 - alpha) * reward
         self._recent_delta[gid] = max(
             self._recent_delta.get(gid, 0.0), delta_norm
         )
+        if self.cfg.ucn_drive_fabric_demotion:
+            self._ucn_streak[gid] = 0
+
+    def record_ucn_suppression(self, gid: int) -> None:
+        """Report that UCN suppressed this Gaussian's update this frame.
+
+        Increments the per-Gaussian streak counter consumed by
+        :meth:`record_update`.  No-op when ``ucn_drive_fabric_demotion``
+        is disabled so this method can be called unconditionally from the
+        pipeline without a per-call config check on the hot path.
+
+        Does NOT touch ``_recent_delta`` or ``_hotness`` — the Gaussian's
+        existing scores simply keep decaying via the EMA each time any
+        other Gaussian triggers a ``record_render`` invalidation, and the
+        sorted-by-hotness order eventually pushes it out of ASC/RSB.
+        """
+        if not self.cfg.ucn_drive_fabric_demotion:
+            return
+        self._ucn_streak[gid] = self._ucn_streak.get(gid, 0) + 1
 
     def record_render(self, visibility_filter: torch.BoolTensor) -> None:
         """Update hotness for all Gaussians visible in the last render.
@@ -189,5 +231,6 @@ class LiveStateFabric:
         """Clear all state. Called between ablation runs."""
         self._hotness.clear()
         self._recent_delta.clear()
+        self._ucn_streak.clear()
         self._cached_mask = None
         self._cached_n = 0

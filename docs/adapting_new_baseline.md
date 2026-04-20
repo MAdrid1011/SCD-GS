@@ -249,14 +249,58 @@ The fast paths in `pipeline.py` require `struct_changed is None` as a gating con
 ### 4. `reset_cwb_each_frame`
 Set this to `True` for baselines that re-initialise their optimizer state every frame (QUEEN), otherwise UCN sees stale history. Leave `False` for baselines where the optimizer carries state (3DGStream Stage 2 Adam).
 
-### 5. `adaptive_ucn_threshold` is not supported on the fast path
-The Mode 1/2/3 vectorised fast path only runs when `cfg.adaptive_ucn_threshold == False` **and** `cfg.frame_level_ucn == True` **and** `struct_changed is None`. If you need adaptive thresholds for your baseline, you'll stay on the slow path — workable for small N but painful for large N (the point of the fast path).
+### 5. `adaptive_ucn_threshold` + fast path (updated in v2 — adaptive now works)
+Since the v2 UCN generalisation the vectorised fast path **does support** `adaptive_ucn_threshold`. The gate is now `cfg.frame_level_ucn == True` **and** `struct_changed is None`; the adaptive threshold is read per-frame through `get_effective_threshold()` and broadcast into the comparator. If you are porting code written against the old gate, drop any `adaptive_ucn_threshold=False` override you put in just to enable the fast path.
 
 ### 6. `optimizer.param_groups[*]["name"]` missing
 Some baselines build the optimizer with no `name` in each group dict. The pipeline treats unnamed groups as network-level (safest default) but you lose per-attribute taxonomy. Patch your baseline to set `name` explicitly — this is always a one-line fix in `gaussian_model.py`.
 
-### 7. FPS measurement crashes with tier mask
-If your baseline's `render()` accesses `gaussians._xyz` (the raw backing tensor) instead of `gaussians.get_xyz`, the `MaskedGaussianProxy` filter won't apply. Most modern baselines use the property API; if yours uses `_xyz` directly, patch those sites to use `get_xyz` or add a matching proxy property.
+### 7. FPS measurement crashes with tier mask — or, worse, *silently* ignores it
+Two failure modes:
+- **(a)** `render()` reads `gaussians._xyz` (raw backing tensor) instead of `gaussians.get_xyz` — `MaskedGaussianProxy` doesn't intercept and the mask is silently bypassed.
+- **(b)** Your ablation runner's `_render_fn` accepts a `g` parameter (the proxy) but then calls `module.forward(cam)` internally — the module holds its own reference to the unmasked `self.renderer.gaussians` and the `g` argument never actually reaches the renderer. This was the HiCoM Mode 2/3 bug that made render-FPS look unchanged even though the fabric mask was active.
+
+The canonical fix for (b) is a try/finally swap inside `_render_fn`:
+
+```python
+def _render_fn(cam, g, pipe_, bg):
+    renderer = module.renderer
+    saved    = renderer.gaussians
+    renderer.gaussians = g            # route the proxy through the real render path
+    try:
+        return module.forward(cam.to(module.device))
+    finally:
+        renderer.gaussians = saved
+```
+
+Verify fix: Mode 2 render-FPS must jump by roughly `n_total / (asc + rsb)` relative to Mode 0/1. If it is flat, one of (a)/(b) is still wired wrong.
+
+### 8. Dense-iter baseline + auto-structural UCN detector — explicit `frame_level_ucn=True` is mandatory
+`cfg.auto_structural_ucn` (default on) *decides* at frame-2 whether to run frame-level UCN. **Frame 1 always runs with whatever `cfg.frame_level_ucn` was at init time.** For dense-iter baselines (QUEEN: 150 Adam steps × 188 K Gaussians × 6 attrs ≈ 170 M Python ops/frame) that means frame 1 falls through to the dict (slow) path and saturates a single CPU core for tens of seconds while the GPU sits idle. Symptom: `nvidia-smi` shows 0% GPU, `top` shows one core at 100%, wall time per frame ≫ expected.
+
+**Fix**: in your `run_<baseline>.py`, pass `frame_level_ucn=True` explicitly to `pipeline.init(...)`. The auto-detector respects user overrides and will not flip it back (see `_user_frame_level_ucn` in `GLASSPipeline`).
+
+Rule of thumb: if your baseline runs > 20 optimizer steps per frame on > 100 K Gaussians, set `frame_level_ucn=True` at construction time. Treat the auto-detector as a safety net for light baselines, not a primary API.
+
+### 9. Path 2 adaptive iteration scheduler — read from `current_frame_suppression_ratio()`, not `_prev_suppression_ratio`
+v2 introduced a unified per-frame suppression-ratio signal, `pipeline.current_frame_suppression_ratio()`, that is populated by **all three** UCN paths (NTC bulk-delta, dict slow path, and vectorised fast path). The legacy `_prev_suppression_ratio` attribute is only updated by `begin_frame()` and by NTC ingest; if you scheduled iterations off it directly you'd miss QUEEN/HiCoM's signals entirely.
+
+If you want Path 2–style early-exit iteration scheduling in your runner:
+
+```python
+base_iters = trainer.config.num_incr_steps          # or equivalent
+prev_ratio = pipeline.current_frame_suppression_ratio()
+adaptive_steps = max(
+    cfg.min_ntc_iters_floor,                        # hard floor from ASICConfig
+    int(round(base_iters * (1.0 - prev_ratio))),
+)
+trainer.config.num_incr_steps = adaptive_steps
+```
+
+See `simulator/ablation/run_hicom.py::_timed_training_loop` for the reference. Skip this step if your baseline's iteration budget is monolithically coupled to other schedules (SH-degree ramp, densification cadence, LR decay) — QUEEN is such a case.
+
+### 10. UCN → Fabric demotion — `record_ucn_suppression` must be wired on every path
+When Path 1 (`cfg.ucn_drive_fabric_demotion=True`, default) is enabled, the pipeline routes `grad_scale == 0` descriptors to `fabric.record_ucn_suppression(gid)` instead of `fabric.record_update(gid, norm)`. All three descriptor paths (NTC, dict, fast) in `pipeline.py` already do this. If you add a fourth path (uncommon), mirror the same `if d.grad_scale <= 0.0: fabric.record_ucn_suppression(...) else: fabric.record_update(...)` branch; otherwise your baseline will never demote stable Gaussians to CSS and Path 1's render-cycle savings evaporate.
 
 ---
 

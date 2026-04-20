@@ -164,15 +164,67 @@ def run_one_mode(mode: int, ds_cfg, n_frames: int | None = None) -> dict:
         last_incr_exc = min(n_total_frames,
                             first_incr + ds_cfg.n_frames_ablation)
 
+        # ``slot.install_hooks`` already wrapped ``trainer.frame_training_loop``
+        # so that ``pipeline.begin_frame()`` fires at the start of every frame.
+        # We must NOT call it a second time here — doing so would reset the
+        # per-frame byte / unique-target caches after the hook already
+        # populated them, and silently zero out the stream stats.
+        _n_gaussians_for_stats = 0
+        # HiCoM trains every incremental frame for ``num_incr_steps`` render +
+        # loss + backward passes (default 200: 100 deform-stage1 + 100 GS-
+        # stage2).  We account for these as 3DGS-style render_training iters
+        # on the ASIC cycle model; this is the only remaining contributor to
+        # asic_train_time_s that the ASIC hooks don't already capture.
+        n_iters_per_frame = int(overrides.get("trainer.num_incr_steps", 200))
+        per_frame_iter_counts: list[int] = []
+
         def _timed_training_loop():
+            nonlocal _n_gaussians_for_stats
             for current_frame in range(first_incr, last_incr_exc):
                 trainer.datamodule.current_frame = current_frame
                 trainer.global_step = 0
-                pipeline.begin_frame()
+
+                # ── Path 2 — UCN→iter scheduler (mode >= 1, frame > first) ──
+                # Mirrors run_3dgstream's adaptive schedule.  The
+                # ``previous frame's`` per-byte UCN suppression ratio is
+                # sourced from the pipeline's feedback accumulators, which
+                # are populated by both pre_optimizer_step (HiCoM's dense
+                # per-iter Adam path) and ingest_ntc_deltas.  Setting
+                # ``trainer.config.num_incr_steps`` here feeds both the GPU
+                # loop (``Trainer.num_steps`` reads it dynamically) and the
+                # ASIC cycle model (``add_gaussian_training_iters`` below),
+                # so wall-clock quality and simulator cycles agree on the
+                # reduced iteration count.  Frame 0 of the ablation window
+                # (``current_frame == first_incr``) always runs the full
+                # base iteration count — no UCN history yet.
+                is_first_ablation_frame = (current_frame == first_incr)
+                if mode >= 1 and not is_first_ablation_frame:
+                    prev_ratio = pipeline.current_frame_suppression_ratio()
+                    adaptive_steps = max(
+                        int(config.min_ntc_iters_floor),
+                        round(n_iters_per_frame * (1.0 - prev_ratio)),
+                    )
+                else:
+                    adaptive_steps = n_iters_per_frame
+                trainer.config.num_incr_steps = adaptive_steps
+                per_frame_iter_counts.append(adaptive_steps)
+
                 with collector.frame_timer():
                     trainer.frame_training_loop()
                 per_frame_delta_bytes.append(
                     pipeline.stream_stats()["frame_active_bytes"]
+                )
+                _n_gaussians_for_stats = slot.n_gaussians()
+                # Book the ASIC render + loss + backward cycles for the
+                # frame we just finished, using the ACTUAL number of steps
+                # the Trainer executed (adaptive_steps) so that the cycle
+                # model and wall-clock measurement agree.  The lag-one
+                # render stats fed by op_hicom._post_step() already
+                # describe a representative viewpoint from the same frame,
+                # so cycle sizing is accurate without any magic-number
+                # scaling.
+                pipeline.add_gaussian_training_iters(
+                    adaptive_steps, n_total=_n_gaussians_for_stats,
                 )
 
         trainer.training_loop = _timed_training_loop
@@ -204,13 +256,34 @@ def run_one_mode(mode: int, ds_cfg, n_frames: int | None = None) -> dict:
 
             if val_cams:
                 def _render_fn(cam, g, pipe_, bg):
-                    return module.forward(cam.to(module.device))
+                    # Temporarily point the renderer at the MaskedGaussianProxy
+                    # (``g``) built by ``pipeline.make_render_proxy()`` so the
+                    # fabric render mask (mode >= 2) and salience keep-mask
+                    # (mode >= 3) actually shape the rasterised workload.
+                    # ``module.forward`` itself never rebinds
+                    # ``self.renderer.gaussians`` (only ``pre_training_step``
+                    # does, and that is not called during inference), so a
+                    # simple try/finally swap is race-free.  Mode 0 / 1 pass
+                    # the unmasked proxy, so their render cost is unchanged.
+                    renderer = module.renderer
+                    saved    = renderer.gaussians
+                    renderer.gaussians = g
+                    try:
+                        return module.forward(cam.to(module.device))
+                    finally:
+                        renderer.gaussians = saved
 
                 fps = collector.measure_fps(
                     pipeline,
                     _render_fn,
                     val_cams, None, None,
                 )
+                # Back-calc render cycles from measured FPS so that
+                # cycle_summary() reports ``asic_render_cycles`` / the
+                # ASIC equivalents — no magic numbers, sourced from the
+                # spec clock_hz.
+                if fps > 0:
+                    pipeline.set_render_cycles_from_fps(fps)
             slot.uninstall_hooks()
     except Exception as e:
         print(f"  FPS measurement failed: {e}")
@@ -238,7 +311,10 @@ def run_one_mode(mode: int, ds_cfg, n_frames: int | None = None) -> dict:
 
     total_storage_mb = collector.measure_storage(out_dir)
     delta_storage_mb = collector.measure_delta_storage(per_frame_delta_bytes)
-    stats = pipeline.stream_stats()
+    # Pass the cached Gaussian count so tier_counts stay accurate even though
+    # slot.uninstall_hooks() has already cleared slot._module.
+    stats         = pipeline.stream_stats(n_gaussians=_n_gaussians_for_stats)
+    cycle_summary = pipeline.cycle_summary()
 
     result = {
         "mode":             mode,
@@ -252,6 +328,25 @@ def run_one_mode(mode: int, ds_cfg, n_frames: int | None = None) -> dict:
         "delta_storage_mb": delta_storage_mb,
         **stats,
         "incremental":      True,
+        **cycle_summary,
+        # asic_commit_time_s: gradient pipeline + optimizer only (mirrors
+        # run_queen / run_3dgstream convention).  Minimal view for
+        # mode 0 → 1 → 2 → 3 comparison of the commit path alone.
+        "asic_commit_time_s": (
+            cycle_summary.get("asic_gradient_pipeline_cycles", 0)
+            + cycle_summary.get("asic_optimizer_cycles", 0)
+        ) / config.asic_spec.clock_hz,
+        # asic_train_time_s: full ASIC incremental training time per frame.
+        #   = n_iters × (render + loss + backward) cycles (from
+        #                 add_gaussian_training_iters)
+        #   + gradient pipeline  (PUOE / ICE etc.)
+        #   + optimizer          (Adam on active Gaussians)
+        # Directly comparable to ``avg_train_time_s`` (GPU wall-clock).
+        "asic_train_time_s": (
+            cycle_summary.get("asic_ntc_train_render_cycles", 0)
+            + cycle_summary.get("asic_gradient_pipeline_cycles", 0)
+            + cycle_summary.get("asic_optimizer_cycles", 0)
+        ) / config.asic_spec.clock_hz,
     }
 
     out_path = GLASS_DIR / "results" / "GLASS_ablation" / ds_cfg.name / "HiCoM"

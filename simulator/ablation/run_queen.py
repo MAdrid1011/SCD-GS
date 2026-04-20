@@ -168,21 +168,24 @@ def run_one_mode(mode: int, ds_cfg, n_frames: int | None = None) -> dict:
         n_frames_ablation=effective_n_frames,
         fps_warmup=ds_cfg.fps_warmup,
         fps_measure=ds_cfg.fps_measure,
-        # UCN configuration for QUEEN with a properly initialised model.
-        # With 188 K Gaussians and temporal-residual training, the gradient
-        # landscape has meaningful structure:
-        #   - Static/background Gaussians: near-zero residual gradients → UCN
-        #     correctly suppresses (saves compute).
-        #   - Dynamic/flame Gaussians: non-zero residual gradients → UCN allows.
-        #
-        # frame_level_ucn=True: CWB stores per-frame mean norms, capturing
-        # which Gaussians persistently need updating across frames — ideal for
-        # flame_steak where fire motion is temporally correlated.
-        #
-        # min_delta_norm=1e-6: looser than the previous 1e-5 that caused
-        # over-suppression, but still filters true floating-point noise.
+        # UCN configuration for QUEEN:
+        # - ``frame_level_ucn=True`` is pinned explicitly (not left to the
+        #   auto-structural detector) because auto-detection only fires at
+        #   the start of frame 2, and frame 1 with 188 K Gaussians × 6 attrs
+        #   × 150 steps on the dict (slow) path saturates a CPU core for
+        #   tens of seconds while the GPU sits idle.  The fast path requires
+        #   ``frame_level_ucn=True`` from step 0, so we must set it up front.
+        #   The auto-detector respects this user override and will not flip
+        #   it back (see ``_user_frame_level_ucn`` in GLASSPipeline).
+        # - ``merge_cos_threshold`` stays at 0.90 (the default); the actual
+        #   per-frame threshold is then moved by the feedback controller
+        #   (``cfg.adaptive_ucn_threshold``, enabled by default) toward
+        #   the target suppression ratio.
+        # - ``min_delta_norm=1e-6`` is QUEEN-specific: the latent-decoder
+        #   (``ldec_*``) path has extremely small per-parameter gradients
+        #   that the default 1e-5 floor would zero out entirely and kill
+        #   the decoder's adaptation.  Not an UCN aggressiveness knob.
         frame_level_ucn=True,
-        merge_cos_threshold=0.90,
         min_delta_norm=1e-6,
     )
     slot      = OpQUEEN()
