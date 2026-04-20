@@ -124,7 +124,11 @@ DATASET_REGISTRY: dict[str, DatasetConfig] = {
         source_path_swift4d  ="data/flame_steak/flame_steak",
         # Pre-trained init models — all paths relative to GLASS_DIR.
         init_model_3dgstream ="data/flame_steak/3dgstream_init",
-        init_model_hicom     ="",   # HiCoM trains frame-0 from scratch
+        # HiCoM frame-0 checkpoint (gaussians + deformation + global_step=15000)
+        # produced by `scripts/train_hicom_init.py --dataset flame_steak`.
+        # When present, run_hicom.py loads it via HiCoM's Config.ckpt_path and
+        # starts ablation from frame 1 (skipping the 15 000-iter init training).
+        init_model_hicom     ="data/flame_steak/hicom_init/ckpt-0-15000.pth",
         # QUEEN Frame-1 PLY (188 K Gaussians, 9 995-iter checkpoint).
         # run_queen.py loads this and starts incremental training from frame 2.
         init_model_queen     ="data/flame_steak/queen_init",
