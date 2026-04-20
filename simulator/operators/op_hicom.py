@@ -52,6 +52,12 @@ class _MergedGaussianAccessor:
 
     def _cat(self, attr: str) -> torch.Tensor:
         b = getattr(self._base, attr)
+        # ``_incr`` may fall back to ``_base`` when HiCoM has not yet spawned
+        # an incremental GaussianModel (e.g. frame 1 stage 1).  Concatenating
+        # in that case would double the row count and break downstream code
+        # that expects ``shape[0] == n_total_gaussians``.
+        if self._incr is self._base:
+            return b
         try:
             i = getattr(self._incr, attr)
             if i is not None and i.numel() > 0:
@@ -135,21 +141,62 @@ class OpHiCoM:
         # ── Post-training-step: intercept all optimizers ──────────────────────
         orig_post = module.post_training_step
 
-        def _post_step(render_pkg):
-            # Call pre_optimizer_step for every optimizer in the module
-            for opt_name in ("optimizer", "gaussians_incr_optimizer",
-                             "deform_optimizer"):
-                opt = getattr(module, opt_name, None)
-                if opt is None:
-                    continue
-                # Also check via deform sub-module
-                if opt_name == "deform_optimizer" and opt is None:
-                    opt = getattr(getattr(module, "deform", None), "optimizer", None)
-                if opt is not None:
-                    pipeline.pre_optimizer_step(opt)
+        # HiCoM owns three optimizers that live *inside* sub-modules of the
+        # libgs Module, not as direct attributes on it.  Only one of them
+        # actually calls ``.step()`` on a given iteration, and which one
+        # depends on the frame / stage (see ``post_training_step_incr``):
+        #
+        #   frame 0                           → module.gaussians.optimizer
+        #   frame 1+, stage 1 (step ≤ N1)     → module.deform.optimizer
+        #   frame 1+, stage 2 (step >  N1)    → module.gaussians_incr.optimizer
+        #
+        # where ``N1 = module.deform.config.num_stage1_steps``.
+        #
+        # ``pipeline.pre_optimizer_step`` must only fire on the optimizer
+        # that is really about to step; otherwise the base-Gaussian .grad
+        # (which stays populated via the shared rasteriser backward but is
+        # never applied in frame 1+) would be double-counted as extra ASIC
+        # update traffic that the hardware never emits.
+        #
+        # The deform optimizer's param_groups have no ``name`` field and
+        # hold only MLP parameters — not per-Gaussian attributes — so even
+        # if we called pre_optimizer_step on it, the pipeline's descriptor
+        # capture would match nothing in ``gaussian_attr_groups``.  We skip
+        # it explicitly to keep the hook free of no-op pipeline calls.
+        def _stepping_gaussian_optimizer():
+            if getattr(trainer, "is_first_frame", False):
+                return getattr(getattr(module, "gaussians", None),
+                               "optimizer", None)
+            deform = getattr(module, "deform", None)
+            if deform is None:
+                return None
+            stage1_steps = int(getattr(deform.config, "num_stage1_steps", 0))
+            if module.global_step > stage1_steps:
+                incr = getattr(module, "gaussians_incr", None)
+                if incr is None:
+                    return None
+                return getattr(incr, "optimizer", None)
+            return None  # stage 1: only the deform MLP steps — no GS traffic
 
+        def _post_step(render_pkg):
+            opt = _stepping_gaussian_optimizer()
+            if opt is not None:
+                pipeline.pre_optimizer_step(opt)
             orig_post(render_pkg)
             pipeline.post_render(render_pkg)
+            # Feed scene statistics to the ASIC cycle model so that the
+            # runner can later account for the render + loss + backward
+            # cycles of this frame via add_gaussian_training_iters()
+            # (lag-one design: stats from frame N size the cycles of
+            # frame N's training loop, flushed at begin_frame N+1).
+            try:
+                sh_deg = int(getattr(module.gaussians, "active_sh_degree", 0))
+            except Exception:
+                sh_deg = 0
+            try:
+                pipeline.set_render_stats_from_render_pkg(render_pkg, sh_deg)
+            except Exception:
+                pass
 
         module.post_training_step = _post_step
         self._orig_post_step = orig_post

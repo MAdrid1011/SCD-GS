@@ -259,6 +259,30 @@ class ConsolidationUnit:
         # Accumulator for frame-level UCN: key=(gid, attr), value=list of norms
         self._frame_accum: dict[tuple, list] = defaultdict(list)
 
+        # ── Feedback-controlled effective threshold ───────────────────────────
+        # Updated each frame by GLASSPipeline.begin_frame() via
+        # ``update_effective_threshold`` when cfg.adaptive_ucn_threshold is
+        # True.  All per-step scale decisions (dict path AND batched fast
+        # path) read ``self._effective_threshold`` instead of
+        # ``cfg.merge_cos_threshold`` directly, so the feedback loop
+        # applies uniformly to every UCN code path.
+        #
+        # Initialisation strategy
+        # -----------------------
+        # When adaptive control is enabled, we start at the UPPER clamp
+        # (``adaptive_ucn_threshold_max``) so UCN is effectively off on
+        # frame 1 — no baseline suffers cold-start over-suppression that
+        # would be hard to recover from.  The feedback loop then pulls
+        # the threshold down toward the value that produces the target
+        # suppression ratio.  When adaptive control is off, we initialise
+        # at ``merge_cos_threshold`` and never change it.
+        if config.adaptive_ucn_threshold:
+            self._effective_threshold: float = float(
+                config.adaptive_ucn_threshold_max
+            )
+        else:
+            self._effective_threshold = float(config.merge_cos_threshold)
+
         # ── Batched (tensor) state — used by the mode-1 fast path only ────────
         # The batched path keeps its own CWB and its own per-frame accumulator
         # so that it never races with the dict-based path; GLASSPipeline
@@ -274,6 +298,45 @@ class ConsolidationUnit:
         # have only 1 row.  The dict path's flush_frame_accum() computes
         # np.mean per (gid, attr) key, which is exactly per-gid denom.
         self._batched_frame_count: dict[str, torch.Tensor] = {}
+
+    # ── Feedback threshold controller ─────────────────────────────────────────
+    def update_effective_threshold(self, observed_ratio: float) -> None:
+        """PI-lite feedback update of ``_effective_threshold``.
+
+        Invoked by GLASSPipeline.begin_frame() once per frame (after a
+        frame's suppression ratio has been measured).  Uses the previous
+        frame's ratio to push the threshold toward
+        ``cfg.adaptive_ucn_target_ratio``.  No-op when
+        ``cfg.adaptive_ucn_threshold`` is False.
+
+        Parameters
+        ----------
+        observed_ratio : float
+            Fraction of descriptors that were suppressed last frame.
+            Values outside [0, 1] are clamped.
+        """
+        if not self.cfg.adaptive_ucn_threshold:
+            return
+        if observed_ratio != observed_ratio:      # NaN guard
+            return
+        observed_ratio = max(0.0, min(1.0, float(observed_ratio)))
+        err  = observed_ratio - float(self.cfg.adaptive_ucn_target_ratio)
+        new_thr = self._effective_threshold + float(self.cfg.adaptive_ucn_kp) * err
+        lo = float(self.cfg.adaptive_ucn_threshold_min)
+        hi = float(self.cfg.adaptive_ucn_threshold_max)
+        if lo > hi:
+            lo, hi = hi, lo
+        self._effective_threshold = max(lo, min(hi, new_thr))
+
+    def get_effective_threshold(self) -> float:
+        """Current similarity threshold used by every UCN code path.
+
+        Reads ``_effective_threshold`` when adaptive control is enabled;
+        otherwise returns the static ``cfg.merge_cos_threshold`` unchanged.
+        """
+        if self.cfg.adaptive_ucn_threshold:
+            return float(self._effective_threshold)
+        return float(self.cfg.merge_cos_threshold)
 
     def flush_frame_accum(self) -> None:
         """Push per-frame mean norms into the CWB.
@@ -354,33 +417,9 @@ class ConsolidationUnit:
             # Historical norms were also near-zero → the Gaussian is dormant
             return 0.0
 
-        # ── Adaptive threshold ────────────────────────────────────────────────
-        # When adaptive_ucn_threshold is enabled, raise the suppression
-        # threshold proportionally to the CWB's coefficient of variation (CV).
-        # High CV (norm is changing a lot) → model is still learning →
-        #   effective_threshold → 1.0 → nothing suppressed.
-        # Low CV (norm is stable)          → model converged →
-        #   effective_threshold = merge_cos_threshold → normal suppression.
-        #
-        # Hardware mapping: a single additional std/mean divider + comparator
-        # gate.  The divider reuses the SRAM bandwidth already used for the
-        # EMA read, so area overhead is < 5 % of the UCN comparator array.
-        if self.cfg.adaptive_ucn_threshold:
-            buf = self.cwb._buf[(gid, attr)]
-            if len(buf) >= 2:
-                vals = list(buf)
-                mean_v = float(np.mean(vals))
-                std_v  = float(np.std(vals))
-                cv     = std_v / (mean_v + 1e-8)
-                cv_c   = min(cv, 1.0)
-                effective_threshold = (
-                    self.cfg.merge_cos_threshold
-                    + cv_c * (1.0 - self.cfg.merge_cos_threshold)
-                )
-            else:
-                effective_threshold = self.cfg.merge_cos_threshold
-        else:
-            effective_threshold = self.cfg.merge_cos_threshold
+        # Read current threshold (static or feedback-controlled — see
+        # ``get_effective_threshold`` and ``update_effective_threshold``).
+        effective_threshold = self.get_effective_threshold()
 
         # Norm-ratio similarity proxy: in [0, 1]
         lo, hi = min(delta_norm, mean_n), max(delta_norm, mean_n)
@@ -432,19 +471,15 @@ class ConsolidationUnit:
           - sim = min(d, m) / max(d, m) > threshold      → scale = 0
           - else                                         → scale = 1
 
-        The adaptive_ucn_threshold branch is NOT implemented here; callers
-        that enable it must use compute_scales() (dict path).  QUEEN uses
-        adaptive_ucn_threshold=False so this restriction is harmless.
+        The effective threshold is resolved via ``get_effective_threshold``;
+        when ``cfg.adaptive_ucn_threshold`` is True, the same frame-level
+        value controlled by ``update_effective_threshold`` drives both the
+        dict path and this batched path uniformly — no code path divergence.
         """
-        if self.cfg.adaptive_ucn_threshold:
-            raise NotImplementedError(
-                "compute_scales_batched() does not support "
-                "adaptive_ucn_threshold; use compute_scales() instead."
-            )
         per_attr_scale: dict[str, torch.Tensor] = {}
         gid_min: torch.Tensor | None = None
         min_dn = float(self.cfg.min_delta_norm)
-        thr    = float(self.cfg.merge_cos_threshold)
+        thr    = float(self.get_effective_threshold())
 
         for attr, norms in attr_to_norms.items():
             n = int(norms.shape[0])
@@ -534,26 +569,23 @@ class ConsolidationUnit:
         ``.item()`` on every descriptor; this batched variant runs the
         same logic on tensors and only returns a tensor (no host sync).
 
-        Restricted to ``frame_level_ucn=True`` and
-        ``adaptive_ucn_threshold=False`` (same as
+        Restricted to ``frame_level_ucn=True`` (same as
         ``compute_scale_single_via_batched`` and the QUEEN fast path).
+        The effective threshold is resolved through
+        ``get_effective_threshold`` so feedback-controlled threshold
+        updates propagate here without further plumbing.
         """
         if not self.cfg.frame_level_ucn:
             raise NotImplementedError(
                 "compute_scales_fallback_batched is only implemented "
                 "for frame_level_ucn=True"
             )
-        if self.cfg.adaptive_ucn_threshold:
-            raise NotImplementedError(
-                "compute_scales_fallback_batched does not support "
-                "adaptive_ucn_threshold"
-            )
         n = int(norms.shape[0])
         if n == 0:
             return norms.new_empty((0,))
         device = norms.device
         min_dn = float(self.cfg.min_delta_norm)
-        thr    = float(self.cfg.merge_cos_threshold)
+        thr    = float(self.get_effective_threshold())
 
         # Read CURRENT CWB (history from prior frames only — not yet
         # accumulated for this step).  Matches the scalar version which
@@ -606,11 +638,6 @@ class ConsolidationUnit:
                 "compute_scale_single_via_batched is only implemented "
                 "for frame_level_ucn=True"
             )
-        if self.cfg.adaptive_ucn_threshold:
-            raise NotImplementedError(
-                "compute_scale_single_via_batched does not support "
-                "adaptive_ucn_threshold"
-            )
         if gid < 0:
             return 1.0
 
@@ -632,7 +659,7 @@ class ConsolidationUnit:
             return 1.0
         if mean_n < self.cfg.min_delta_norm:
             return 0.0
-        thr = self.cfg.merge_cos_threshold
+        thr = self.get_effective_threshold()
         lo, hi = min(delta_norm, mean_n), max(delta_norm, mean_n)
         sim = lo / hi if hi > 0 else 0.0
         return 0.0 if sim > thr else 1.0
