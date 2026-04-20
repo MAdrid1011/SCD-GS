@@ -10,3 +10,6 @@
 [submodule "baselines/HiCoM"]
 	path = baselines/HiCoM
 	url = https://github.com/gqk/HiCoM.git
+[submodule "baselines/4DGC"]
+	path = baselines/4DGC
+	url = https://github.com/qianghu-huber/4DGC.git
