@@ -54,7 +54,8 @@ Full mechanism write-up: `GLASS.md` Appendix A.
 **What the numbers will say:**
 - `asic_ice_cycles` **decreases** vs Mode 1 (merged pass is cheaper).
 - `asic_optimizer_cycles` drops sharply — Adam only runs on hot Gaussians (ASC + qualifying RSB), typically ~3k out of ~200k for QUEEN.
-- `render_fps` jumps roughly proportional to `(asc+rsb)/n_total` — for QUEEN on flame_steak we see ~3× (140 → 430 FPS).
+- `asic_ntc_train_render_cycles` drops proportionally too: `pipeline._train_render_active_counts()` scales `n_visible` / `tile_touches` by the hot-tier ratio so `add_render_training_iter` sees the same masked population that inference does. This is what GLASS §6 calls "Dual-Consumer Access" — update and render consumers share on-fabric residency, so ILSF's savings apply to both training render+backward cycles and inference render cycles, not just inference.
+- `render_fps` jumps roughly by `1 / (N_active_M0 / N_active_Mi)` — see the three-column contribution table below for exact numbers.
 - Training wall-clock may be slightly **higher** than Mode 1 (the fabric's Python sort is not free); the ASIC estimate still improves because cycles reflect the silicon, not the simulator host.
 - Quality is typically within 0.1-0.3 dB of Mode 1.
 
@@ -79,21 +80,28 @@ Full mechanism write-up: `GLASS.md` Appendix A.
 
 Every mode produces a JSON with the same schema. The headline fields:
 
+The full canonical key order — identical for every baseline — lives in
+`simulator/ablation/result_schema.py` (`SCHEMA_KEYS`). Highlights:
+
 | Field | Unit | Meaning |
 |-------|------|---------|
-| `avg_train_time_s` | s/frame | GPU wall-clock per incremental frame (drop-first-frame + top-10% trimmed mean) |
-| `asic_train_time_s` | s | ASIC-projected incremental training time at `ASICSpec.clock_hz` |
-| `asic_commit_time_s` | s | Subset of ASIC time that is UCN + ICE + Optimizer (the streamed commit phase) |
+| `asic_train_time_s` | s | Headline — ASIC per-frame incremental training time at `ASICSpec.clock_hz`. Sum of the relevant `asic_*_cycles` buckets divided by `clock_hz` (each runner documents which buckets apply). |
+| `asic_commit_time_s` | s | Commit path only: `(gradient_pipeline + optimizer) / clock_hz`. Isolates Mode 0→1→2 movement from NTC-training / render cycles. |
 | `psnr` / `ssim` / `lpips` | — | Averaged over all test cameras on all trained frames |
-| `render_fps` | fps | `pipeline.measure_fps()` — tier mask active in Mode ≥ 2 |
+| `render_fps` | fps | **Headline.** ASIC modelled FPS = `clock_hz / add_render_inference(n_active, n_visible, tile_touches, H, W, sh_degree)`; tier mask is baked into `n_active` / `n_visible` / `tile_touches` via `make_render_proxy()` for Mode ≥ 2. |
+| `render_fps_gpu_measured` | fps | Diagnostic. GPU wall-clock FPS on the same `MaskedGaussianProxy`; never used for cycle accounting. |
+| `render_n_active` / `render_n_visible` / `render_tile_touches` / `render_H` / `render_W` | — | Inputs that fed `add_render_inference`. Makes `render_fps` derivable by hand from any `mode_*.json`. |
 | `total_storage_mb` | MB | Final checkpoint footprint on disk |
 | `delta_storage_mb` | MB | Sum of per-frame update bytes across the run |
 | `frame_total_bytes` | B | Bytes emitted by the last frame's update stream |
 | `frame_suppressed_bytes` | B | Subset of the above suppressed by UCN |
 | `frame_suppression_ratio` | — | `suppressed / total` |
 | `frame_unique_targets` | — | Number of distinct Gaussians touched in the last frame |
-| `run_total_bytes` / `run_suppressed_bytes` | B | Run-level accumulators |
+| `run_total_bytes` / `run_suppressed_bytes` / `run_suppression_ratio` | B / B / ratio | Run-level accumulators |
+| `base_train_iters` / `avg_train_iters` / `per_frame_train_iters` | — | Per-frame training-iteration schedule. Populated by 3DGStream / 4DGC / HiCoM (UCN feedback controls iter count in Mode ≥ 1); `null` for QUEEN whose `opt.iterations` is monolithic. |
 | `asic_<unit>_cycles` | cycles | Per-unit totals; see `docs/cycle_accounting.md` |
+
+GPU wall-clock timings (formerly `avg_train_time_s` / `all_frame_times_s`) are *not* written — they are simulator-host artefacts, not ASIC properties — and the redundant `asic_time_s_1ghz = asic_total_cycles / clock_hz` is also omitted since it silently excluded NTC-training cycles and was easily mistaken for `asic_train_time_s`. To migrate any older result files in place, run `python -m simulator.ablation.migrate_results`.
 
 ### Cross-mode expectations — fast sanity check
 
@@ -113,45 +121,66 @@ The last line is the "progressive improvement" property. If Mode 2 is slower tha
 
 ---
 
-## Worked example — three baselines on flame_steak (10 frames)
+## Worked example — four baselines on flame_steak (10 frames)
 
-Numbers below come from the v2 UCN run (Path 1 + Path 2 + adaptive threshold enabled). The corresponding design notes live in `GLASS.md` Appendix A.
-
-**QUEEN** (188 K Gaussians, dense per-frame Adam — optimizer-bound):
-
-| Mode | `avg_train_time_s` | `asic_train_time_s` | PSNR | SSIM | Render FPS |
-|------|-------------------:|--------------------:|-----:|-----:|-----------:|
-| 0    | 17.6               | **1.957**           | 29.85 | 0.931 | 152 |
-| 1    | 15.8               | **0.565** (3.5× ↓)  | 29.20 | 0.924 | 152 |
-| 2    | 20.5               | **0.568**           | 29.18 | 0.923 | 437 |
-| 3    | 26.9               | **0.572**           | 29.15 | 0.923 | 449 |
+Numbers from the 2026-04 ablation sweep (`results/GLASS_ablation/flame_steak/summary.csv`). All four baselines run through the same `result_schema.build_result` canonical JSON.
 
 **3DGStream** (NTC-bound — the bottleneck is network training, not Adam):
 
-| Mode | `asic_train_time_s` | `avg_ntc_iters` | PSNR | Render FPS |
-|------|--------------------:|----------------:|-----:|-----------:|
-| 0    | **9.46**            | 150             | 17.14 | 143 |
-| 1    | **0.65** (14.5× ↓)  | 63.7            | 17.05 | 143 |
-| 2    | **0.65**            | 63.7            | 17.02 | 944 |
-| 3    | **0.65**            | 63.7            | 17.00 | 983 |
+| Mode | `asic_train_time_s` | `avg_train_iters` | PSNR | Render FPS |
+|------|--------------------:|------------------:|-----:|-----------:|
+| 0    | **9.885**           | 150               | 17.14 | 797.5  |
+| 1    | **0.957** (10.3× ↓) | ≈63               | 16.97 | 796.1  |
+| 2    | **0.763**           | ≈63               | 16.95 | 2811.7 |
+| 3    | **0.758**           | ≈63               | 16.92 | 2913.7 |
+
+**QUEEN** (188 K Gaussians, dense per-frame Adam — optimizer-bound):
+
+| Mode | `asic_train_time_s` | PSNR | SSIM | Render FPS |
+|------|--------------------:|-----:|-----:|-----------:|
+| 0    | **1.958**           | 29.84 | 0.929 | 918.8  |
+| 1    | **0.565** (3.5× ↓)  | 29.15 | 0.919 | 955.1  |
+| 2    | **0.307**           | 29.15 | 0.919 | 2956.6 |
+| 3    | **0.305**           | 29.15 | 0.919 | 2962.4 |
 
 **HiCoM** (render+backward-bound — base Gaussians hard-frozen):
 
-| Mode | `asic_train_time_s` | `num_incr_steps` (avg) | PSNR | Render FPS |
-|------|--------------------:|-----------------------:|-----:|-----------:|
-| 0    | **0.960**           | 200                    | 25.75 | 76  |
-| 1    | **0.051** (18.8× ↓) | ≈37                    | 24.80 | 76  |
-| 2    | **0.051**           | ≈37                    | 24.72 | 287 |
-| 3    | **0.051**           | ≈37                    | 24.66 | 303 |
+| Mode | `asic_train_time_s` | `avg_train_iters` (≡ `num_incr_steps`) | PSNR | Render FPS |
+|------|--------------------:|---------------------------------------:|-----:|-----------:|
+| 0    | **0.964**           | 200                                    | 26.00 | 269.2  |
+| 1    | **0.053** (18.2× ↓) | ≈37                                    | 24.65 | 257.1  |
+| 2    | **0.012**           | ≈37                                    | 24.31 | 2622.3 |
+| 3    | **0.012**           | ≈37                                    | 24.61 | 3014.7 |
 
-Cross-baseline takeaways:
+**4DGC** (EntropyBottleneck + MEM training + per-frame grid + render+backward — all paths active):
 
-- **Mode 1 speed-up source shifts per baseline**: QUEEN gets it from Path 1 (`grad_scale → 0` skips Adam); 3DGStream gets it from Path 2 (adaptive threshold converges over ~3 frames, then the iter scheduler halves NTC training); HiCoM gets it from both Path 1 (fabric demotion cuts render cost) *and* Path 2 (early exit), compounded by fewer densification steps keeping `n_visible` small — see `GLASS.md §A.3` "cascade effect".
-- **Render-FPS jump in Mode 2** is present on all three baselines now (3DGStream 6.6×, QUEEN 2.9×, HiCoM 3.8×). Pre-v2 fix, HiCoM showed 0× — the proxy wasn't reaching its renderer. See `docs/adapting_new_baseline.md` pitfall #7(b).
-- **Quality delta Mode 0 → Mode 3** is ≤ 1.1 dB PSNR for all three baselines, and PSNR is monotonically non-increasing along 0→3. Adaptive threshold keeps the knee-point reliable without per-baseline tuning.
-- **3DGStream's 3-frame smoke vs 10-frame ablation discrepancy**: at 3 frames, `asic_train_time(Mode 1) ≈ 0.95 × Mode 0` — the adaptive threshold hasn't converged to steady-state yet. The 14.5× number only shows up once the feedback controller has had enough frames to settle (≈ 4–5 frames on this scene). If you are benchmarking a new baseline, run at least 10 frames before drawing conclusions about Mode 1's asymptotic speed-up.
+| Mode | `asic_train_time_s` | `avg_train_iters` (MEM) | PSNR | Render FPS |
+|------|--------------------:|------------------------:|-----:|-----------:|
+| 0    | **3.682**           | 100                     | 32.95 | 434.5  |
+| 1    | **1.247** (3.0× ↓)  | ≈73                     | 32.19 | 434.1  |
+| 2    | **0.820**           | ≈73                     | 32.29 | 3644.8 |
+| 3    | **0.604**           | ≈73                     | 32.51 | 3890.3 |
 
-`avg_train_time_s` (GPU wall-clock) **rising** in Modes 2/3 for QUEEN is a *simulator-host* artefact (unoptimised Python in `LiveStateFabric.get_render_mask`), not an ASIC property. The hardware estimate (`asic_train_time_s`) is what the paper should report.
+### Technique → cycle bucket → quantified contribution
+
+Each of UCN / ILSF / Salience primarily moves one or two cycle buckets. The table below pins the mechanism, the bucket it reduces, and the observed absolute gain from the flame_steak sweep above:
+
+| Technique | Primary cycle bucket it shrinks | Mechanism | Observed gain on flame_steak (10 f) |
+|---|---|---|---|
+| **UCN** (M0 → M1) | `asic_ntc_train_cycles` + `asic_ntc_train_render_cycles` + `asic_optimizer_cycles` | Adaptive iteration scheduler cuts `n_iters` (`base → ~37-73`); `grad_scale=0` skips Adam on suppressed rows | 3DGS 10.3×, QUEEN 3.5×, HiCoM 18.2×, 4DGC 3.0× on `asic_train_time_s` |
+| **ILSF** (M1 → M2) | `asic_ntc_train_render_cycles` + `asic_optimizer_cycles` + `asic_render_cycles` | Hot-tier mask (ASC ∪ hot-RSB) scales `n_active` / `n_visible` / `tile_touches` in both `add_render_training_iter` (GLASS §6 Dual-Consumer Access) and `add_render_inference` | ASIC train: 3DGS 1.25×, QUEEN 1.84×, HiCoM 4.4×, 4DGC 1.52×. Inference FPS: 3DGS 3.5×, QUEEN 3.1×, HiCoM 10.2×, 4DGC 8.4× |
+| **Salience** (M2 → M3) | `asic_ntc_train_render_cycles` (low-value tail) + tile work in `asic_render_cycles` | PROMOTE/FULL classifier drops stable low-contribution Gaussians from tile expansion before rasterize | ASIC train: 4DGC 1.36× (largest); others already bottom out at compute floor (0.012 s / 0.30 s). Inference FPS: +3-15% across all baselines |
+
+(Absolute cycle counts per bucket per mode are in the `mode_*.json` files; this is a pointer, not a replacement.)
+
+### Cross-baseline takeaways
+
+- **Mode 1 speed-up source shifts per baseline**: QUEEN gets it from Path 1 (`grad_scale → 0` skips Adam); 3DGStream gets it from Path 2 (adaptive threshold converges over ~3 frames, then the iter scheduler halves NTC training); HiCoM gets it from both Path 1 (fabric demotion cuts render cost) *and* Path 2 (early exit), compounded by fewer densification steps keeping `n_visible` small — see `GLASS.md §A.3` "cascade effect". 4DGC gets it from Path 2 throttling MEM training iterations while UCN-suppressed bytes never hit the NTC path.
+- **Render-FPS jump in Mode 2** is present on all four baselines now and the cross-baseline spread is physically motivated: `(M2 FPS) / (M0 FPS) ≈ (N_active,M0 · avg_tile_touches_M0) / (N_active,M2 · avg_tile_touches_M2)`. HiCoM and 4DGC see the biggest jumps because they have the lowest hot-tier ratios (1.4% and 4.5% respectively on flame_steak). Pre-2026-04 fix, `render_fps` was back-calculated from GPU wall-clock on the masked proxy, which folded simulator-host kernel overhead into the ASIC number and produced misleading spreads (e.g. 4DGC M2/M0 = 27× from artificially low GPU M0). The current `add_render_inference` formula models ASIC render cycles directly from EWA-splatting phases 1-3 so the ratios are bandwidth- and throughput-consistent.
+- **Quality delta Mode 0 → Mode 3** is ≤ 1.7 dB PSNR for all four baselines, and PSNR is monotonically non-increasing only up to noise on short 10-frame runs. Adaptive threshold keeps the knee-point reliable without per-baseline tuning.
+- **3DGStream's 3-frame smoke vs 10-frame ablation discrepancy**: at 3 frames, `asic_train_time(Mode 1) ≈ 0.95 × Mode 0` — the adaptive threshold hasn't converged to steady-state yet. The 10× number only shows up once the feedback controller has had enough frames to settle (≈ 4–5 frames on this scene). If you are benchmarking a new baseline, run at least 10 frames before drawing conclusions about Mode 1's asymptotic speed-up.
+
+A note on GPU wall-clock: the four runners still measure per-frame wall-clock via `MetricsCollector.frame_timer()` for internal profiling, but this number is deliberately **not** emitted to `mode_*.json`. It is a simulator-host artefact (unoptimised Python in `LiveStateFabric.get_render_mask` can make QUEEN Modes 2/3 look *slower* on the host, which is the opposite of the ASIC behaviour). The headline the paper reports is `asic_train_time_s` + `render_fps`. `render_fps_gpu_measured` is retained per-mode as a diagnostic so the ASIC-vs-host gap is auditable.
 
 ---
 

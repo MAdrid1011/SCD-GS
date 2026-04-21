@@ -28,7 +28,7 @@ Before opening a PR that touches either path:
 2. Run `python simulator/ablation/run_queen.py --mode 1 --n-frames 3`.
 3. Save the resulting JSON aside.
 4. Restore the dispatcher, rerun.
-5. `diff` the two JSONs. The only fields allowed to differ are wall-clock timings (`avg_train_time_s`, `asic_train_time_s` is allowed to be *faster* but its cycle components must match).
+5. `diff` the two JSONs. `asic_train_time_s` is allowed to be *faster* on the fast path, but every `asic_*_cycles` bucket must match exactly.
 
 If any cycle count or byte count differs by one, a regression has been introduced — fix it before asking for review.
 
@@ -58,7 +58,7 @@ Each baseline has its own conda env — they have conflicting dependency pins (d
 - `queen-cu121`
 - `3dgstream`
 - `hicom`
-- `swift4d`
+- `4dgc-cu121`
 
 The simulator itself runs in any of them because it only depends on `torch` and standard-library modules.
 
