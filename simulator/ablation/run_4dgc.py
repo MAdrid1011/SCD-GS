@@ -51,6 +51,7 @@ sys.path.insert(0, str(GLASS_DIR))       # import simulator.*
 sys.path.insert(0, str(BASELINE_DIR))    # import scene, arguments, mem, …
 
 # ── Simulator imports (must come after sys.path setup) ────────────────────────
+from simulator.ablation.result_schema import build_result
 from simulator.config import ASICConfig
 from simulator.datasets import load_dataset_config
 from simulator.metrics.collector import MetricsCollector
@@ -219,6 +220,16 @@ def run_one_mode(mode: int, ds_cfg) -> dict:
 
     try:
         for frame_idx, frame in enumerate(frames):
+            # Frame boundary: advance pipeline version, reset per-frame state
+            # (stream, fabric deltas, feedback accumulators), and tick the
+            # adaptive-UCN threshold controller using the just-finished
+            # frame's suppression signal.  Must fire BEFORE reading
+            # ``_prev_suppression_ratio`` below, because begin_frame
+            # consumes the feedback accumulators and persists the canonical
+            # ratio value in that attribute.  Parity with run_3dgstream /
+            # run_queen / run_hicom.
+            pipeline.begin_frame()
+
             frame_src = str(video_path / frame)
             frame_out = str(out_root / frame)
             os.makedirs(frame_out, exist_ok=True)
@@ -280,6 +291,19 @@ def run_one_mode(mode: int, ds_cfg) -> dict:
                 except Exception as exc:
                     print(f"  [frame {frame_idx}] post_render skipped: {exc}")
 
+            # ── Stage 2 render+loss+backward cycles ─────────────────────────
+            # 4DGC trains compensated Gaussians for ``iterations_s2`` full
+            # render+bwd steps *after* the MEM commit (mirrors 3DGStream's
+            # Stage 2).  ingest_ntc_deltas only accounts for Stage-1 MEM-driven
+            # render iters, so Stage 2 would otherwise be missing from
+            # asic_ntc_train_render_cycles.  Uses the just-captured render
+            # stats (same frame, same scene) which matches what the GPU ran.
+            iters_s2 = int(getattr(args, "iterations_s2", 0))
+            if iters_s2 > 0 and gaussians is not None:
+                pipeline.add_gaussian_training_iters(
+                    iters_s2, n_total=int(gaussians.get_xyz.shape[0])
+                )
+
             per_frame_delta_bytes.append(
                 pipeline.stream_stats()["frame_active_bytes"]
             )
@@ -298,6 +322,7 @@ def run_one_mode(mode: int, ds_cfg) -> dict:
     # ── FPS measurement ───────────────────────────────────────────────────────
     print("\n  Measuring FPS …")
     fps = 0.0
+    fps_diag: dict = {}
     gaussians = _ref["gaussians"]
     scene     = _ref["scene"]
     if gaussians is not None and last_pp_extract is not None:
@@ -308,12 +333,12 @@ def run_one_mode(mode: int, ds_cfg) -> dict:
             if test_cams:
                 slot._gaussians = gaussians
                 slot._pipeline  = pipeline
-                fps = collector.measure_fps(
-                    pipeline,
+                fps_diag = pipeline.measure_asic_render_fps(
                     lambda cam, g, p, bg: gs_render(cam, g, p, bg),
                     test_cams, last_pp_extract, last_background,
+                    sh_degree=int(gaussians.active_sh_degree),
                 )
-                pipeline.set_render_cycles_from_fps(fps)
+                fps = fps_diag["asic_fps"]
         except Exception as exc:
             print(f"  FPS measurement failed: {exc}")
 
@@ -344,33 +369,33 @@ def run_one_mode(mode: int, ds_cfg) -> dict:
     avg_mem_iters = (sum(per_frame_mem_iters) / len(per_frame_mem_iters)
                      if per_frame_mem_iters else base_iters)
 
-    result = {
-        "mode":                mode,
-        "baseline":            "4DGC",
-        "dataset":             ds_cfg.name,
-        "n_frames_trained":    len(frames),
-        "avg_train_time_s":    collector.avg_frame_time(),
-        "all_frame_times_s":   collector.all_frame_times(),
-        "render_fps":          fps,
-        **quality,
-        "total_storage_mb":    total_storage_mb,
-        "delta_storage_mb":    delta_storage_mb,
-        **stats,
-        "incremental":         True,
-        "base_ntc_iters":      base_iters,    # MEM iterations (kept under the
-        "avg_ntc_iters":       avg_mem_iters, # 3DGStream-compatible key name)
-        "per_frame_ntc_iters": per_frame_mem_iters,
-        **cycle_summary,
-        # Same ASIC train-time formula as 3DGStream: MEM fwd+bwd+Adam over
-        # all Stage-1 iters + per-iter render + commit + Stage-2 Adam.
-        "asic_train_time_s": (
-            cycle_summary.get("asic_ntc_train_render_cycles", 0)
-            + cycle_summary.get("asic_ntc_train_cycles", 0)
-            + cycle_summary.get("asic_ntc_cycles", 0)
-            + cycle_summary.get("asic_gradient_pipeline_cycles", 0)
-            + cycle_summary.get("asic_optimizer_cycles", 0)
-        ) / config.asic_spec.clock_hz,
-    }
+    # Same ASIC train-time formula as 3DGStream: MEM fwd+bwd+Adam over
+    # all Stage-1 iters + per-iter render + commit + Stage-2 Adam.
+    asic_train_time_s = (
+        cycle_summary.get("asic_ntc_train_render_cycles", 0)
+        + cycle_summary.get("asic_ntc_train_cycles", 0)
+        + cycle_summary.get("asic_ntc_cycles", 0)
+        + cycle_summary.get("asic_gradient_pipeline_cycles", 0)
+        + cycle_summary.get("asic_optimizer_cycles", 0)
+    ) / config.asic_spec.clock_hz
+
+    result = build_result(
+        baseline="4DGC",
+        dataset=ds_cfg.name,
+        mode=mode,
+        n_frames_trained=len(frames),
+        quality=quality,
+        render_fps=fps,
+        total_storage_mb=total_storage_mb,
+        delta_storage_mb=delta_storage_mb,
+        asic_train_time_s=asic_train_time_s,
+        cycle_summary=cycle_summary,
+        stream_stats=stats,
+        fps_diagnostic=fps_diag,
+        base_train_iters=base_iters,
+        avg_train_iters=avg_mem_iters,
+        per_frame_train_iters=per_frame_mem_iters,
+    )
 
     # ── Save JSON ─────────────────────────────────────────────────────────────
     json_dir  = GLASS_DIR / "results" / "GLASS_ablation" / ds_cfg.name / "4DGC"
@@ -379,10 +404,7 @@ def run_one_mode(mode: int, ds_cfg) -> dict:
     with open(json_file, "w") as f:
         json.dump(result, f, indent=2)
     print(f"\n  Results saved → {json_file}")
-    print(json.dumps(
-        {k: v for k, v in result.items() if k != "all_frame_times_s"},
-        indent=2,
-    ))
+    print(json.dumps(result, indent=2))
     return result
 
 

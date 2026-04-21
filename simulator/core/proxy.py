@@ -39,7 +39,7 @@ class MaskedGaussianProxy:
     """Read-only view into a Gaussian model, exposing only indexed entries.
 
     Works transparently with any Gaussian model that exposes the standard
-    property API (3DGStream, QUEEN, HiCoM MergedGaussianModel, Swift4D).
+    property API (3DGStream, QUEEN, HiCoM MergedGaussianModel, 4DGC).
 
     Parameters
     ----------

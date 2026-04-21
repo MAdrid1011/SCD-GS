@@ -42,11 +42,6 @@ methods:
     # cfg_args, and the last trained frame's point_cloud.ply.
     prior_run: data/assets/QUEEN/flame_steak_prior
 
-  Swift4D:
-    conda_env: queen-cu121   # Swift4D shares the queen env (same CUDA/PyTorch)
-    repo: baselines/Swift4D
-    output_dir: results/Swift4D
-
   HiCoM:
     conda_env: hicom-cu121
     repo: baselines/HiCoM
@@ -54,6 +49,19 @@ methods:
     # HiCoM uses a pre-processed variant of the scene (different layout
     # than raw N3DV); user-supplied under data/ (see benchmarks/README.md).
     data_root: data/hicom_flame_steak_scene
+
+  4DGC:
+    conda_env: 4dgc-cu121
+    repo: baselines/4DGC
+    output_dir: results/4DGC
+    # 4DGC expects the ``colmap_<k>`` directory layout (one sub-dir per
+    # frame; ``sparse/`` shared from colmap_0).  Generate via symlinks
+    # from ``data/3dgstream_flame_steak_scene``; see benchmarks/README.md.
+    data_root: data/4dgc_flame_steak_scene
+    # Frame-0 init (3DGS 10k + Motion_Grid warmup); both produced once
+    # via ``train_initial.py`` and ``scripts/Motion_Grid_warmup.py``.
+    init_model: data/flame_steak/4dgc_init
+    init_mem:   data/flame_steak/4dgc_init/mem.pth
 
 metrics:
   - train_sec_per_frame        # incremental training (excludes frame-0 init)

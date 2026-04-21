@@ -12,7 +12,7 @@ Produces:
 Columns
 -------
   baseline, mode, mode_label,
-  avg_train_time_s, Δtrain_time_s,
+  asic_train_time_s, Δtrain_time_s,
   render_fps,       Δrender_fps,
   psnr,             Δpsnr,
   ssim,             Δssim,
@@ -23,6 +23,10 @@ Columns
 
 Δ columns are the absolute difference relative to mode 0 for that baseline.
 Positive Δ = improvement vs baseline ASIC (mode 0).
+
+The headline time is the ASIC per-frame training time; GPU wall-clock
+was removed from the unified schema (it's a simulator-host artefact
+and is not representative of the ASIC target).
 
 Usage
 -----
@@ -43,26 +47,24 @@ from typing import Any
 GLASS_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(GLASS_DIR))
 
+from simulator.ablation.result_schema import MODE_LABELS
 from simulator.datasets import load_dataset_config
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-BASELINES = ["3DGStream", "QUEEN", "HiCoM", "Swift4D"]
+BASELINES = ["3DGStream", "QUEEN", "HiCoM", "4DGC"]
 MODES     = [0, 1, 2, 3]
-MODE_LABELS = {
-    0: "Base ASIC",
-    1: "+Consolidation",
-    2: "+Live Fabric",
-    3: "+Salience",
-}
 
 # Metrics where higher is better (Δ positive = good)
 HIGHER_IS_BETTER = {"render_fps", "psnr", "ssim"}
 # Metrics where lower is better (Δ negative = good)
-LOWER_IS_BETTER  = {"avg_train_time_s", "lpips", "total_storage_mb", "delta_storage_mb"}
+LOWER_IS_BETTER  = {
+    "asic_train_time_s",
+    "lpips", "total_storage_mb", "delta_storage_mb",
+}
 
 NUMERIC_COLS = [
-    "avg_train_time_s",
+    "asic_train_time_s",
     "render_fps",
     "psnr",
     "ssim",
@@ -123,8 +125,8 @@ def build_table(rows: list[dict]) -> str:
         ("Baseline",         12, None),
         ("Mode",              2, None),
         ("Label",            16, None),
-        ("TrainTime(s)",      9, "avg_train_time_s"),
-        ("Δ",                 7, "d_avg_train_time_s"),
+        ("ASICTrain(s)",      9, "asic_train_time_s"),
+        ("Δ",                 7, "d_asic_train_time_s"),
         ("FPS",               8, "render_fps"),
         ("Δ",                 7, "d_render_fps"),
         ("PSNR",              7, "psnr"),

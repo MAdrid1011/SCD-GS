@@ -1,7 +1,7 @@
 """
 BaseOperatorSlot — abstract base class for Stage-0 operator slots.
 
-Each concrete slot (op_3dgstream.py, op_queen.py, op_hicom.py, op_swift4d.py)
+Each concrete slot (op_3dgstream.py, op_queen.py, op_hicom.py, op_4dgc.py)
 is responsible for exactly three things:
 
   1. Declaring which param-group names are per-Gaussian Gaussian attributes

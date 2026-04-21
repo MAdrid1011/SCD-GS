@@ -54,7 +54,7 @@ if TYPE_CHECKING:
 class GLASSPipeline:
     """Shared ASIC pipeline — Stages 1 through 5.
 
-    The same instance handles 3DGStream, QUEEN, HiCoM, and Swift4D. The only
+    The same instance handles 3DGStream, QUEEN, HiCoM, and 4DGC. The only
     model-specific wiring is provided by the BaseOperatorSlot injected at
     construction.
 
@@ -476,6 +476,9 @@ class GLASSPipeline:
         enc_dim: int = 0,
         ntc_output_dim: int = 0,
         n_ntc_iters_max: int = 0,
+        eb_total_elements: int = 0,
+        eb_filters: tuple = (3, 3, 3, 3),
+        hash_bytes_per_param: int = 2,
     ) -> None:
         """Ingest per-Gaussian NTC delta norms into the ASIC cycle model.
 
@@ -491,7 +494,9 @@ class GLASSPipeline:
                            features_rest.  Computed from real tensor diffs.
         total_d          : int — total attribute dimensions (from tensor shapes).
         ntc_macs_per_g   : MLP MACs per Gaussian (from layer weight counts).
-        n_hash_params    : HashGrid fp16 parameter count (measured at runtime).
+        n_hash_params    : HashGrid / 3-D grid parameter count (measured at
+                           runtime).  For 4DGC Motion_Grid this is the total
+                           float count across all three multi-res grids.
         enc_dim          : HashGrid output feature dim (n_levels × n_feat).
         ntc_output_dim   : MLP output dimension (ntc_model.n_output_dims).
         n_ntc_iters_max  : actual NTC training iterations that ran this frame.
@@ -501,6 +506,23 @@ class GLASSPipeline:
                            and sets args.iterations accordingly before training,
                            so the GPU and the cycle model use the same count.
                            0 means NTC training cycles are not counted.
+        eb_total_elements: total number of grid elements processed by
+                           EntropyBottleneck modules per iter, summed across
+                           all EB instances (4DGC only; other baselines pass 0
+                           and pay no EB cost).  For 4DGC flame_steak this is
+                           the full Motion_Grid tensor volume (≈ 5.37 M).
+        eb_filters       : CompressAI EB filter tuple.  Per-element cycle
+                           cost is derived entirely from this structure
+                           inside :meth:`CycleAccumulator.add_entropy_bottleneck_training`
+                           (no magic constants).  Default ``(3,3,3,3)`` is
+                           the CompressAI baseline and matches 4DGC's
+                           ``Motion_Grid``.
+        hash_bytes_per_param: storage width of each grid/hash entry in the
+                           backing table.  Default 2 matches tcnn HashGrid's
+                           fp16 storage (used by 3DGStream and HiCoM's
+                           compact tables).  Callers with fp32-stored grids
+                           (4DGC Motion_Grid) must pass ``4``; the cycle
+                           model then scales DRAM load traffic accordingly.
         """
         N = norms.shape[0]
         if N == 0 or total_d == 0:
@@ -514,18 +536,41 @@ class GLASSPipeline:
         if ntc_macs_per_g > 0 and n_ntc_iters_max > 0:
             n_iters = n_ntc_iters_max
             self._cycles.add_ntc_training(
-                N, ntc_macs_per_g, n_hash_params, enc_dim, ntc_output_dim, n_iters
+                N, ntc_macs_per_g, n_hash_params, enc_dim, ntc_output_dim, n_iters,
+                hash_bytes_per_param=hash_bytes_per_param,
             )
+            # EntropyBottleneck rate-loss training (4DGC MEM only).  Runs on
+            # the same schedule as ntc_train above, so we key it off the same
+            # n_iters; baselines that pass eb_total_elements=0 get a no-op.
+            if eb_total_elements > 0:
+                self._cycles.add_entropy_bottleneck_training(
+                    eb_total_elements, n_iters,
+                    filters=eb_filters,
+                )
 
         # Per-iteration 3DGS render forward + photometric loss + backward.
         # Uses scene statistics measured from the PREVIOUS frame's inference render
         # (same lag-one design as _prev_suppression_ratio).  Frame 0: skipped (None).
+        #
+        # Mode ≥ 2: scale n, n_visible, and tile_touches by the fabric /
+        # salience residency ratio so that the training-render cycles
+        # see the same subset as the inference-render proxy — see
+        # :meth:`_train_render_active_counts`.  This is the mechanism by
+        # which ILSF (Mode 2) and Salience (Mode 3) reduce
+        # ``asic_ntc_train_render_cycles`` on baselines whose
+        # runner-installed render hook always feeds the full
+        # ``_prev_render_stats`` (3DGStream, QUEEN, HiCoM).  Modes 0/1
+        # are unaffected (active_ratio = 1.0).
         if n_iters > 0 and self._prev_render_stats is not None:
             rs = self._prev_render_stats
+            n_active, ratio = self._train_render_active_counts(N)
+            n_vis_scaled = max(1, int(rs["n_visible"] * ratio)) \
+                             if rs["n_visible"] > 0 else 0
+            tt_scaled    = int(rs["tile_touches"] * ratio)
             self._cycles.add_render_training_iter(
-                N,
-                rs["n_visible"],
-                rs["tile_touches"],
+                n_active,
+                n_vis_scaled,
+                tt_scaled,
                 rs["H"],
                 rs["W"],
                 rs["sh_degree"],
@@ -537,7 +582,8 @@ class GLASSPipeline:
         # (training → optimised weights → one inference → NTC deltas captured).
         if ntc_macs_per_g > 0 and enc_dim > 0 and ntc_output_dim > 0:
             self._cycles.add_ntc_forward(
-                N, ntc_macs_per_g, n_hash_params, enc_dim, ntc_output_dim
+                N, ntc_macs_per_g, n_hash_params, enc_dim, ntc_output_dim,
+                hash_bytes_per_param=hash_bytes_per_param,
             )
 
         # Stage 0: build N descriptors from measured delta norms.
@@ -1539,6 +1585,102 @@ class GLASSPipeline:
 
         return self.cfg.fps_measure / max(elapsed, 1e-9)
 
+    def measure_asic_render_fps(
+        self,
+        render_fn,
+        cameras: list,
+        pipe,
+        bg: torch.Tensor,
+        sh_degree: int,
+    ) -> dict:
+        """Model-based ASIC render FPS + co-measured GPU wall-clock FPS.
+
+        **This is the headline-FPS measurement used by every ablation runner.**
+        Unlike the legacy :meth:`measure_fps` (which returns only GPU-host
+        FPS and then back-calculates ``asic_render_cycles`` from it), this
+        path *models* ASIC render cycles directly from the EWA splatting
+        formulas in :meth:`CycleAccumulator.add_render_inference`, using
+        the exact ``n_visible``/``tile_touches``/``H``/``W``/``sh_degree``
+        stats the masked proxy produces under the current ablation mode.
+
+        Rationale (ties back to the 2026-04 cross-baseline FPS audit):
+        the simulator hosts four baselines whose GPU-side render_fn
+        vary by SH degree, Gaussian scale distribution, kernel-launch
+        overhead and TF32/AMP flags.  Back-calculating
+        ``asic_render_cycles = clock_hz / gpu_fps`` folds all those
+        simulator-host artefacts into the ASIC number and makes M0 FPS
+        heterogeneous across baselines for reasons unrelated to the
+        GLASS architecture.  Modelling the cycle bucket from first
+        principles (phases 1-3 of EWA splatting) gives a bandwidth- and
+        throughput-consistent ASIC FPS that is directly comparable.
+
+        The GPU FPS is still measured on the same proxy and returned as
+        a diagnostic so we can audit the delta between ASIC-modelled
+        and host-measured throughput.
+
+        Parameters
+        ----------
+        render_fn : callable(camera, gaussians, pipe, bg) → render_pkg
+        cameras   : list of camera objects
+        pipe, bg  : passed through to render_fn
+        sh_degree : gaussians.active_sh_degree at call time
+
+        Returns
+        -------
+        dict with keys
+          asic_fps        : ASIC modelled FPS (clock_hz / render_cycles)
+          gpu_fps         : GPU wall-clock FPS on the same masked proxy
+          render_cycles   : single-frame ASIC render cycle count
+          n_active        : Gaussians on the fabric (masked proxy size)
+          n_visible       : (radii > 0).sum() after one render
+          tile_touches    : n_visible × π × (avg_r/16)²
+          H, W            : render resolution
+        """
+        proxy = self.make_render_proxy()
+        n_active = int(proxy.get_xyz.shape[0])
+
+        # ---- One extra render to capture masked stats (not timed) ------
+        with torch.no_grad():
+            rp = render_fn(cameras[0], proxy, pipe, bg)
+        radii = rp["radii"]
+        n_vis = int((radii > 0).sum().item())
+        img   = rp["render"]
+        H     = int(img.shape[-2])
+        W     = int(img.shape[-1])
+        if n_vis > 0:
+            avg_r = float(radii[radii > 0].float().mean().item())
+        else:
+            avg_r = 0.0
+        # tile_size=16 from diff-gaussian-rasterization config.h (BLOCK_X=BLOCK_Y=16)
+        tile_size = 16
+        tile_touches = int(n_vis * math.pi * (avg_r / tile_size) ** 2) \
+                         if avg_r > 0 else 0
+
+        # ---- Model ASIC render cycles from those stats -----------------
+        render_cycles = self._cycles.add_render_inference(
+            n_active=n_active,
+            n_visible=n_vis,
+            tile_touches=tile_touches,
+            H=H, W=W,
+            sh_degree=sh_degree,
+        )
+        asic_fps = (self.cfg.asic_spec.clock_hz / max(render_cycles, 1)) \
+                     if render_cycles > 0 else 0.0
+
+        # ---- Co-measure GPU wall-clock FPS for diagnostic comparison ---
+        gpu_fps = self.measure_fps(render_fn, cameras, pipe, bg)
+
+        return {
+            "asic_fps":      float(asic_fps),
+            "gpu_fps":       float(gpu_fps),
+            "render_cycles": int(render_cycles),
+            "n_active":      n_active,
+            "n_visible":     n_vis,
+            "tile_touches":  tile_touches,
+            "H":             H,
+            "W":             W,
+        }
+
     # ── Statistics ────────────────────────────────────────────────────────────
 
     def stream_stats(self, n_gaussians: int | None = None) -> dict:
@@ -1592,8 +1734,11 @@ class GLASSPipeline:
     def cycle_summary(self) -> dict:
         """Return per-unit ASIC cycle counts and critical-path total.
 
-        Includes the 1 GHz timing estimate (asic_time_s_1ghz).
-        Call after the last frame and after set_render_cycles_from_fps().
+        Call after the last frame and after
+        :meth:`set_render_cycles_from_fps`.  Every ablation runner then
+        passes this dict through :func:`result_schema.build_result`,
+        which converts cycle buckets into the canonical JSON schema and
+        derives the headline ``asic_train_time_s`` per baseline.
         """
         return self._cycles.summary()
 
@@ -1627,6 +1772,69 @@ class GLASSPipeline:
             return
         self._cycles.add_mlp_training(n_params, n_iters)
 
+    def _train_render_active_counts(
+        self, n_total: int
+    ) -> tuple[int, float]:
+        """Per-mode active-Gaussian count the ASIC train render backend sees.
+
+        GLASS §6 ("Dual-Consumer Access") and §5.4 ("Salience-First
+        Issue") state that update- and render-side consumers share the
+        same on-fabric residency — i.e. **training-time** render +
+        backward passes must see exactly the same ASC∪RSB∪FULL subset
+        that inference sees, not the whole Gaussian set.  Without this
+        coupling, ``add_render_training_iter`` is sized against all N
+        Gaussians regardless of ``cfg.mode``, and the Mode 2/3 masks
+        only show up in inference-time FPS — ``asic_ntc_train_render_cycles``
+        stays constant across 1→2→3 and produces the flat ASIC train
+        time that motivated this helper.
+
+        Masking semantics mirror :meth:`make_render_proxy` exactly so
+        that the training-render cycle model and the inference-render
+        proxy agree on which Gaussians are considered resident:
+
+        +----------+-------------------------------------------------------+
+        | mode 0/1 | no fabric mask on train render ⇒ n_active = n_total  |
+        | mode 2   | hot tier only (ASC ∪ hot-RSB)                        |
+        | mode 3   | further intersected with salience keep mask          |
+        +----------+-------------------------------------------------------+
+
+        All masks are sourced live from :class:`LiveStateFabric` and
+        :class:`SalienceFirstIssue`; no scaling constants are
+        introduced.  The lower bound of ``max(1, n_active)`` matches
+        :meth:`make_render_proxy`'s "always render at least one
+        Gaussian" invariant so that the cycle model never collapses to
+        zero render work on a frame where the fabric is still
+        bootstrapping.
+
+        Parameters
+        ----------
+        n_total
+            Total Gaussian count in the current frame (typically
+            ``gaussians.get_xyz.shape[0]``).
+
+        Returns
+        -------
+        n_active, active_ratio
+            Floating-point ratio = ``n_active / n_total`` (``1.0`` in
+            modes 0/1).  Callers scale ``n_visible`` and
+            ``tile_touches`` by ``active_ratio`` so that Phase 1 reads,
+            Phase 2 radix-sort length, and Phase 3/5 alpha-compositing
+            MACs all reflect the sub-setted render.
+        """
+        if n_total <= 0 or self.cfg.mode < 2:
+            return max(1, n_total), 1.0
+        mask = self.fabric.get_render_mask(n_total)
+        if self.cfg.mode >= 3:
+            keep, _ = self.salience.classify(n_total)
+            mask = mask & keep
+        n_active = int(mask.sum().item())
+        # Mirror make_render_proxy()'s "at least one Gaussian" floor so
+        # the first few frames (before fabric hotness converges) never
+        # collapse render cycles to zero while the baseline GPU run is
+        # still doing real work.
+        n_active = max(1, min(n_total, n_active))
+        return n_active, n_active / n_total
+
     def add_gaussian_training_iters(self, n_iters: int, n_total: int = 0) -> None:
         """Account for QUEEN-style direct-Gaussian training iterations.
 
@@ -1637,6 +1845,12 @@ class GLASSPipeline:
         in that frame.  Internally delegates to CycleAccumulator.
         add_render_training_iter() reusing the same ntc_train_render counter so
         that asic_ntc_train_render_cycles and asic_train_time_s work correctly.
+
+        Mode-awareness:
+          ``_train_render_active_counts`` caps ``n``, ``n_visible`` and
+          ``tile_touches`` at the fabric (mode ≥ 2) and salience (mode ≥ 3)
+          residency under the same rule as :meth:`make_render_proxy`.
+          Mode 0 / 1 are unaffected (``active_ratio = 1.0``).
 
         Parameters
         ----------
@@ -1650,10 +1864,24 @@ class GLASSPipeline:
             return
         rs  = self._prev_render_stats
         n   = n_total if n_total > 0 else rs["n_visible"]
+        n_active, ratio = self._train_render_active_counts(n)
+        # Proportionally subset visibility and tile touches.  avg-radius
+        # (implicit in tile_touches / n_visible) is invariant to
+        # random subsampling by hotness — a uniformly-scaled fraction
+        # of Gaussians preserves per-Gaussian tile density — so we keep
+        # the ratio linear and avoid inventing any new scaling constant.
+        # Linear scaling only — do NOT floor tile_touches at n_visible.
+        # tile_touches = n_visible × π × (avg_r/16)² routinely falls
+        # below n_visible when avg_r < 16/√π ≈ 9 px (small Gaussians
+        # touch less than one 16×16 tile on average), so an ad-hoc
+        # floor would inflate Phase 3/5 cycles beyond what the
+        # unmasked accounting produces.
+        n_vis_scaled = max(1, int(rs["n_visible"] * ratio)) if rs["n_visible"] > 0 else 0
+        tt_scaled    = int(rs["tile_touches"] * ratio)
         self._cycles.add_render_training_iter(
-            n,
-            rs["n_visible"],
-            rs["tile_touches"],
+            n_active,
+            n_vis_scaled,
+            tt_scaled,
             rs["H"],
             rs["W"],
             rs["sh_degree"],

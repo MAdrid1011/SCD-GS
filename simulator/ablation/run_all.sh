@@ -8,14 +8,16 @@
 #
 # Usage
 # -----
-#   bash run_all.sh                                 # default dataset: flame_steak
-#   bash run_all.sh meet_room                       # future dataset
-#   bash run_all.sh custom /path/to/my.yaml         # fully custom via YAML
+#   bash run_all.sh                                       # dataset=flame_steak, n_frames from DatasetConfig
+#   bash run_all.sh flame_steak "" 10                     # override to 10 frames
+#   bash run_all.sh custom /path/to/my.yaml               # fully custom via YAML
+#   bash run_all.sh custom /path/to/my.yaml 10            # YAML + frame override
 #
 # Arguments
 # ---------
-#   $1  Dataset name (default: flame_steak)
-#   $2  Optional: path to YAML file with DatasetConfig overrides
+#   $1  Dataset name                     (default: flame_steak)
+#   $2  Optional: path to YAML overrides (default: empty)
+#   $3  Optional: n_frames override      (default: empty ⇒ use DatasetConfig.n_frames_ablation)
 #
 # Output
 # ------
@@ -34,10 +36,14 @@ GLASS="${GLASS:-$(cd "$SIM/../.." && pwd)}"
 
 DATASET="${1:-flame_steak}"
 DATASET_YAML="${2:-}"
+N_FRAMES="${3:-}"
 
 extra_args=""
 if [[ -n "$DATASET_YAML" ]]; then
     extra_args="--dataset-config $DATASET_YAML"
+fi
+if [[ -n "$N_FRAMES" ]]; then
+    extra_args="$extra_args --n-frames $N_FRAMES"
 fi
 
 # Conda environments per baseline
@@ -45,9 +51,9 @@ declare -A ENVS
 ENVS["3dgstream"]="3dgstream-cu121"
 ENVS["queen"]="queen-cu121"
 ENVS["hicom"]="hicom-cu121"
-ENVS["swift4d"]="queen-cu121"   # Swift4D shares the queen env (same CUDA/PyTorch)
+ENVS["4dgc"]="4dgc-cu121"
 
-BASELINES=("3dgstream" "queen" "hicom" "swift4d")
+BASELINES=("3dgstream" "queen" "hicom" "4dgc")
 
 total_runs=$(( ${#BASELINES[@]} * 4 ))
 run_idx=0
@@ -56,6 +62,7 @@ echo "============================================================"
 echo " GLASS ASIC Ablation Run"
 echo " Dataset  : $DATASET"
 echo " YAML cfg : ${DATASET_YAML:-<none>}"
+echo " n_frames : ${N_FRAMES:-<DatasetConfig default>}"
 echo " Total runs: $total_runs  (${#BASELINES[@]} baselines × 4 modes)"
 echo "============================================================"
 
@@ -103,10 +110,14 @@ echo " All training runs complete. Aggregating results …"
 echo "============================================================"
 
 COLLECT_LOG="$GLASS/results/GLASS_ablation/$DATASET/collect.log"
+collect_args="--dataset $DATASET"
+if [[ -n "$DATASET_YAML" ]]; then
+    collect_args="$collect_args --dataset-config $DATASET_YAML"
+fi
+# Intentionally omit --n-frames here: the aggregator only reads existing
+# mode_*.json files and has no concept of training scope.
 conda run --no-capture-output -n "${ENVS[3dgstream]}" \
-    python "$SIM/collect_ablation.py" \
-    --dataset "$DATASET" \
-    $extra_args \
+    python "$SIM/collect_ablation.py" $collect_args \
     2>&1 | tee "$COLLECT_LOG"
 
 echo ""

@@ -6,7 +6,7 @@ AttrClass       — canonical attribute taxonomy shared by all 4 models.
 Design note
 -----------
 This module is **fully model-agnostic**. It knows nothing about 3DGStream,
-QUEEN, HiCoM, or Swift4D. The only model-specific knowledge lives in the
+QUEEN, HiCoM, or 4DGC. The only model-specific knowledge lives in the
 Operator Slots (operators/op_*.py), which translate each model's optimizer
 group names into AttrClass via from_group_name().
 """
@@ -41,7 +41,8 @@ class AttrClass(str, Enum):
                       "rotation", "added_xyz", "added_f_dc", ...
           QUEEN     : same Gaussian attrs + "decoder", "gate"
           HiCoM     : same Gaussian attrs + "deform", "deform_optimizer"
-          Swift4D   : same Gaussian attrs + "hash" (hash-grid dynamic branch)
+          4DGC      : same Gaussian attrs + "grid", "tinymlp",
+                      "entropy_bottleneck*" (MEM motion-grid branch)
         """
         n = name.lower().strip()
         if "xyz" in n:
@@ -54,7 +55,7 @@ class AttrClass(str, Enum):
             return cls.OPACITY
         if any(tok in n for tok in ("f_dc", "f_rest", "feat", "sh_", "_sh")):
             return cls.FEATURES
-        # Fall-through: decoder, gate, ntc, hash, deform, etc.
+        # Fall-through: decoder, gate, ntc, mem, grid, tinymlp, entropy, deform, etc.
         return cls.NETWORK
 
     def payload_floats(self) -> int:

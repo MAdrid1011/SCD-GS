@@ -15,7 +15,6 @@ name: meet_room
 source_path_3dgstream: data/meet_room/meet_room
 source_path_queen:      data/meet_room/meet_room
 source_path_hicom:      data/meet_room/hicom_meet_room_scene
-source_path_swift4d:    data/meet_room/meet_room
 init_model_3dgstream:   data/meet_room/3dgstream_meet_room_scene
 n_frames_ablation: 30
 extra_args:
@@ -27,10 +26,6 @@ extra_args:
     max_frames: 30
   hicom:
     trainer.num_incr_steps: 200
-  swift4d:
-    configs: arguments/dynerf/meet_room.py
-    test_iterations: "1000"
-    save_iterations: "1000"
 """
 from __future__ import annotations
 
@@ -69,7 +64,6 @@ class DatasetConfig:
     source_path_3dgstream: str = ""   # COLMAP frame* sub-directory layout
     source_path_queen:     str = ""   # cam*/ multi-camera layout
     source_path_hicom:     str = ""   # libgs-compatible layout
-    source_path_swift4d:   str = ""   # DyNeRF / COLMAP layout
     source_path_4dgc:      str = ""   # COLMAP colmap_* sub-directory layout
 
     # ── Pre-trained frame-0 model roots ──────────────────────────────────────
@@ -101,7 +95,7 @@ class DatasetConfig:
     fps_measure: int = 50
 
     # ── Per-model extra arguments ─────────────────────────────────────────────
-    # Keys: "3dgstream", "queen", "hicom", "swift4d", "4dgc"
+    # Keys: "3dgstream", "queen", "hicom", "4dgc"
     # Values: dict of argparse-style kwarg overrides forwarded to each baseline.
     # Boolean flags are expressed as True/False (converted to store_true args).
     extra_args: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -129,7 +123,6 @@ DATASET_REGISTRY: dict[str, DatasetConfig] = {
         source_path_3dgstream="data/3dgstream_flame_steak_scene",
         source_path_queen    ="data/flame_steak/flame_steak",
         source_path_hicom    ="data/hicom_flame_steak_scene",
-        source_path_swift4d  ="data/flame_steak/flame_steak",
         # 4DGC expects ``colmap_<k>`` folder naming (vs 3DGStream's
         # ``frame<k>``), each with its own ``images/`` sub-dir.
         source_path_4dgc     ="data/4dgc_flame_steak_scene",
@@ -189,12 +182,6 @@ DATASET_REGISTRY: dict[str, DatasetConfig] = {
                 "trainer.num_incr_steps": 200,
                 "trainer.num_init_steps": 15000,
             },
-            "swift4d": {
-                "configs":         "arguments/dynerf/flame_steak.py",
-                "test_iterations": "1000 3000 5000 7000 9000 11000 13001",
-                "save_iterations": "13001",
-                "expname":         "dynerf/flame_steak",
-            },
             "4dgc": {
                 # Frame-0 init model was produced by train_initial.py at
                 # SH degree 1 (first_load_iteration matches its save iter).
@@ -227,7 +214,6 @@ DATASET_REGISTRY: dict[str, DatasetConfig] = {
     #     source_path_3dgstream="data/meet_room/meet_room",
     #     source_path_queen    ="data/meet_room/meet_room",
     #     source_path_hicom    ="data/hicom_meet_room_scene",
-    #     source_path_swift4d  ="data/meet_room/meet_room",
     #     init_model_3dgstream ="data/meet_room/3dgstream_scene",
     #     n_frames_ablation    =30,
     #     extra_args={ ... },

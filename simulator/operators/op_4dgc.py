@@ -104,6 +104,12 @@ class Op4DGC:
         self._mem_enc_dim:       int = 0
         self._mem_macs_per_g:    int = 0
         self._mem_out_dim:       int = 0
+        # EntropyBottleneck filter topology, measured from the live EB module
+        # (tuple of inner filter widths — CompressAI default is (3,3,3,3);
+        # 4DGC constructs all three EBs with this same default).  Passed to
+        # ``CycleAccumulator.add_entropy_bottleneck_training`` so per-element
+        # MACs/ops are derived from real module structure, not hard-coded.
+        self._mem_eb_filters:    tuple = ()
         # Maximum MEM training iterations per frame (= args.iterations from runner).
         self._mem_n_iters_max:   int = 0
 
@@ -196,10 +202,19 @@ class Op4DGC:
             # Output dim — last Linear out_features.  Matches (Δxyz 3 + Δrot 4).
             out_dim = int(mlp_layers[-1].out_features) if mlp_layers else 0
 
+            # EntropyBottleneck filter tuple — read from any of the three
+            # EB modules (they all share CompressAI's ``filters=(3,3,3,3)``
+            # default in 4DGC; see Motion_Grid.__init__).  Using the live
+            # attribute keeps the cycle model in lock-step with any future
+            # baseline tweak to that knob.
+            eb = getattr(motion_grid, "entropy_bottleneck0", None)
+            eb_filters = tuple(eb.filters) if eb is not None else ()
+
             self._mem_n_grid_params = n_grid_params
             self._mem_enc_dim       = enc_dim
             self._mem_macs_per_g    = mlp_macs
             self._mem_out_dim       = out_dim
+            self._mem_eb_filters    = eb_filters
         except Exception as exc:
             print(f"  [Op4DGC] MEM param measurement failed: {exc}; "
                   "MEM cycles will not be counted.")
@@ -207,15 +222,17 @@ class Op4DGC:
             self._mem_enc_dim       = 0
             self._mem_macs_per_g    = 0
             self._mem_out_dim       = 0
+            self._mem_eb_filters    = ()
 
         orig_update = gaussians.update_by_mem
 
         # Capture measured params in closure (values are stable across frames)
-        _n_grid  = self._mem_n_grid_params
-        _enc     = self._mem_enc_dim
-        _macs    = self._mem_macs_per_g
-        _out     = self._mem_out_dim
-        _n_iters = self._mem_n_iters_max
+        _n_grid     = self._mem_n_grid_params
+        _enc        = self._mem_enc_dim
+        _macs       = self._mem_macs_per_g
+        _out        = self._mem_out_dim
+        _eb_filters = self._mem_eb_filters
+        _n_iters    = self._mem_n_iters_max
 
         def _hooked_update():
             # Snapshot backing tensors BEFORE the MEM commit.
@@ -246,6 +263,21 @@ class Op4DGC:
                     enc_dim=_enc,
                     ntc_output_dim=_out,
                     n_ntc_iters_max=_n_iters,
+                    # MEM's three EntropyBottleneck modules each consume the
+                    # full element count of their matching Motion_Grid[i]
+                    # tensor every training iter (rate loss).  Since EB_i is
+                    # paired 1-to-1 with grid[i] and grid[i].numel() ==
+                    # grid_param_i, the sum over the three grids equals the
+                    # total EB element count.  Baselines without EB pass 0.
+                    eb_total_elements=_n_grid,
+                    eb_filters=_eb_filters,
+                    # Motion_Grid._init_grid stores grid tensors as fp32
+                    # (torch.randn default dtype; see baselines/4DGC/scene/
+                    # Motion_Grid.py).  3DGStream / HiCoM use tcnn HashGrid
+                    # in fp16, so the default of 2 is wrong for us — we
+                    # must tell the cycle model that every grid load pulls
+                    # 4 bytes from DRAM.
+                    hash_bytes_per_param=4,
                 )
 
         gaussians.update_by_mem = _hooked_update
@@ -340,14 +372,22 @@ class Op4DGC:
         weights — all network-level (not per-Gaussian).  We apply the same
         ntc_grad_threshold hard cutoff 3DGStream uses for its NTC optimizer,
         which for MEM plays the same role.
+
+        Implementation note: we avoid a per-parameter ``.item()`` sync by
+        doing the comparison on-device and multiplying the gradient by a
+        0-d keep mask.  ``mul_(0)`` is equivalent to ``zero_()``; ``mul_(1)``
+        is a no-op.  This removes several forced cudaStreamSynchronize calls
+        per training iteration in modes 1/2/3.
         """
         if self._pipeline is None or self._pipeline.cfg.mode < 1:
             return
         thresh = self._pipeline.cfg.ntc_grad_threshold
         for group in mem_optimizer.param_groups:
             for p in group["params"]:
-                if p.grad is not None and p.grad.norm().item() < thresh:
-                    p.grad.zero_()
+                if p.grad is None:
+                    continue
+                keep = (p.grad.norm() >= thresh).to(p.grad.dtype)
+                p.grad.mul_(keep)
 
     # ── Structural change notification ────────────────────────────────────────
 

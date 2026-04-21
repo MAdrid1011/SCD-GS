@@ -27,7 +27,6 @@ import argparse
 import json
 import os
 import sys
-import time
 from pathlib import Path
 
 GLASS_DIR    = Path(__file__).resolve().parents[2]
@@ -36,6 +35,7 @@ BASELINE_DIR = GLASS_DIR / "baselines" / "QUEEN"
 sys.path.insert(0, str(GLASS_DIR))
 sys.path.insert(0, str(BASELINE_DIR))
 
+from simulator.ablation.result_schema import build_result
 from simulator.config import ASICConfig
 from simulator.datasets import load_dataset_config
 from simulator.metrics.collector import MetricsCollector
@@ -197,7 +197,6 @@ def run_one_mode(mode: int, ds_cfg, n_frames: int | None = None) -> dict:
     # Since training() creates gaussians internally, we patch render_mask to
     # get a reference to the gaussians object and install hooks lazily.
 
-    frame_times: list[float] = []
     per_frame_delta_bytes: list[int] = []
     _state = {"gaussians": None, "optimizer": None, "installed": False,
                "frame_t0": None, "frame_idx": 0,
@@ -208,6 +207,12 @@ def run_one_mode(mode: int, ds_cfg, n_frames: int | None = None) -> dict:
                # ran in each frame.  Used by add_gaussian_training_iters() to
                # model the 3DGS render+loss+bwd cycles for asic_train_time_s.
                "train_iters_this_frame": 0,
+               # Flushed into ``per_frame_train_iters`` in the unified JSON
+               # schema so QUEEN's monolithic schedule still appears on the
+               # per-frame axis (usually one constant per frame because
+               # ``opt.iterations`` is not UCN-driven, but kept explicit for
+               # parity with 3DGStream / HiCoM / 4DGC reporting).
+               "per_frame_iters": [],
                # Total trainable parameters in QUEEN's network param groups
                # (decoder + gate).  Measured once at first hook install and
                # used by add_network_training() to model decoder/gate backprop.
@@ -306,6 +311,8 @@ def run_one_mode(mode: int, ds_cfg, n_frames: int | None = None) -> dict:
                 _state.get("n_network_params", 0),
                 n_iters,
             )
+            if n_iters > 0:
+                _state["per_frame_iters"].append(int(n_iters))
             _state["train_iters_this_frame"] = 0
             pipeline.begin_frame()
             _state["cur_frame_idx"] = cam_frame
@@ -397,7 +404,6 @@ def run_one_mode(mode: int, ds_cfg, n_frames: int | None = None) -> dict:
     _train_mod.render_mask = _patched_render_mask
 
     # ── Run QUEEN training ─────────────────────────────────────────────────────
-    t0_total = time.perf_counter()
     try:
         with collector.frame_timer():
             queen_training(
@@ -427,10 +433,9 @@ def run_one_mode(mode: int, ds_cfg, n_frames: int | None = None) -> dict:
             _state.get("n_network_params", 0),
             n_iters_last,
         )
+        if n_iters_last > 0:
+            _state["per_frame_iters"].append(int(n_iters_last))
         _state["train_iters_this_frame"] = 0
-
-    total_time = time.perf_counter() - t0_total
-    avg_frame_time = total_time / max(effective_n_frames, 1)
 
     _n_cached = _state.get("n_gaussians", 0)
     per_frame_delta_bytes.append(
@@ -446,6 +451,7 @@ def run_one_mode(mode: int, ds_cfg, n_frames: int | None = None) -> dict:
     # ── Aggregate PSNR / SSIM / LPIPS from intercepted test-camera renders ────
     quality = {"psnr": float("nan"), "ssim": float("nan"), "lpips": float("nan")}
     fps = 0.0
+    fps_diag: dict = {}
     _n_gaussians_for_stats: int = 0
     lpips_val = float("nan")
 
@@ -501,13 +507,13 @@ def run_one_mode(mode: int, ds_cfg, n_frames: int | None = None) -> dict:
             else:
                 slot._gaussians = gaussians
 
-            fps = collector.measure_fps(
-                pipeline,
+            fps_diag = pipeline.measure_asic_render_fps(
                 lambda cam, g, p, bg_: orig_render_mask(cam, g, p, bg_),
                 _recent_cams, pp_extract, background,
+                sh_degree=int(getattr(gaussians, "active_sh_degree", 3)),
             )
-            print(f"  render_fps = {fps:.1f}")
-            pipeline.set_render_cycles_from_fps(fps)
+            fps = fps_diag["asic_fps"]
+            print(f"  render_fps (asic) = {fps:.1f}   gpu = {fps_diag['gpu_fps']:.1f}")
 
             # Save n_gaussians before uninstall clears slot._gaussians so that
             # stream_stats() can compute accurate fabric tier_counts later.
@@ -535,41 +541,44 @@ def run_one_mode(mode: int, ds_cfg, n_frames: int | None = None) -> dict:
     stats = pipeline.stream_stats(n_gaussians=_n_gaussians_for_stats)
     cycle_summary = pipeline.cycle_summary()
 
-    result = {
-        "mode":             mode,
-        "baseline":         "QUEEN",
-        "dataset":          ds_cfg.name,
-        "n_frames_trained": effective_n_frames,
-        "avg_train_time_s": avg_frame_time,
-        "render_fps":       fps,
-        **quality,
-        "total_storage_mb": total_storage_mb,
-        "delta_storage_mb": delta_storage_mb,
-        **stats,
-        "incremental":      True,
-        **cycle_summary,
-        # asic_commit_time_s: ASIC commit-path only (gradient capture + Adam).
-        # Minimal view: excludes render cost, useful for comparing mode 0 → 1 → 2 → 3.
-        "asic_commit_time_s": (
-            cycle_summary.get("asic_gradient_pipeline_cycles", 0)
-            + cycle_summary.get("asic_optimizer_cycles", 0)
-        ) / config.asic_spec.clock_hz,
-        # asic_train_time_s: FULL ASIC incremental training time per frame.
-        #   = render_train cycles  (n_iters × 3DGS render+loss+bwd, modelled via
-        #                           add_gaussian_training_iters at frame boundary)
-        #   + gradient pipeline    (PUOE gradient capture)
-        #   + optimizer            (Adam on active Gaussians)
-        #   / clock_hz
-        # Directly comparable to avg_train_time_s (GPU wall-clock per frame):
-        #   avg_train_time_s     → GPU incremental training time
-        #   asic_train_time_s    → ASIC incremental training time at clock_hz
-        # Speedup = avg_train_time_s / asic_train_time_s
-        "asic_train_time_s": (
-            cycle_summary.get("asic_ntc_train_render_cycles", 0)
-            + cycle_summary.get("asic_gradient_pipeline_cycles", 0)
-            + cycle_summary.get("asic_optimizer_cycles", 0)
-        ) / config.asic_spec.clock_hz,
-    }
+    # asic_train_time_s: FULL ASIC incremental training time per frame.
+    #   = render_train cycles  (n_iters × 3DGS render+loss+bwd, modelled via
+    #                           add_gaussian_training_iters at frame boundary)
+    #   + gradient pipeline    (PUOE gradient capture)
+    #   + optimizer            (Adam on active Gaussians)
+    #   / clock_hz
+    asic_train_time_s = (
+        cycle_summary.get("asic_ntc_train_render_cycles", 0)
+        + cycle_summary.get("asic_gradient_pipeline_cycles", 0)
+        + cycle_summary.get("asic_optimizer_cycles", 0)
+    ) / config.asic_spec.clock_hz
+
+    # QUEEN's ``opt.iterations`` is not UCN-driven, so the per-frame
+    # counter is just the constant iteration budget; we still record
+    # base / avg / per_frame for JSON-schema parity.
+    per_frame_train_iters = list(_state["per_frame_iters"])
+    base_train_iters      = (per_frame_train_iters[0]
+                             if per_frame_train_iters else None)
+    avg_train_iters       = (sum(per_frame_train_iters) / len(per_frame_train_iters)
+                             if per_frame_train_iters else None)
+
+    result = build_result(
+        baseline="QUEEN",
+        dataset=ds_cfg.name,
+        mode=mode,
+        n_frames_trained=effective_n_frames,
+        quality=quality,
+        render_fps=fps,
+        total_storage_mb=total_storage_mb,
+        delta_storage_mb=delta_storage_mb,
+        asic_train_time_s=asic_train_time_s,
+        cycle_summary=cycle_summary,
+        stream_stats=stats,
+        fps_diagnostic=fps_diag,
+        base_train_iters=base_train_iters,
+        avg_train_iters=avg_train_iters,
+        per_frame_train_iters=per_frame_train_iters,
+    )
 
     out_dir.mkdir(parents=True, exist_ok=True)
     out_file = out_dir / f"mode_{mode}.json"

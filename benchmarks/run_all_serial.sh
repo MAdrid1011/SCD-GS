@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Serial GPU-baseline benchmark runner: 3DGStream → Swift4D → HiCoM → aggregate.
+# Serial GPU-baseline benchmark runner: 3DGStream → HiCoM → QUEEN → aggregate.
+# (4DGC is benchmarked via simulator/ablation/run_4dgc.py, which doubles as its
+# head-to-head harness; see that runner for per-frame stage-1/stage-2 timing.)
 # Each task runs exclusively on the GPU; no concurrent execution.
 #
 # This is the *GPU* head-to-head harness that sits alongside the ASIC-cycle
@@ -51,45 +53,8 @@ log "Step 2 — 3DGStream eval (PSNR/SSIM/LPIPS + FPS) ..."
     2>&1 | tee "$RESULTS/3DGStream/flame_steak/eval_log.txt")
 log "Step 2 — 3DGStream eval DONE."
 
-# ─── STEP 3: Swift4D training (bundled, 13000 iterations) ──────────────────
-log "Step 3 — Swift4D training (all frames bundled) ..."
-mkdir -p "$RESULTS/Swift4D/flame_steak"
-(cd "$GLASS_DIR/baselines/Swift4D" &&
- conda run --no-capture-output -n "$QUEEN_ENV" \
-    python train.py \
-    -s "$GLASS_DIR/data/flame_steak/flame_steak" \
-    --port 6017 \
-    --expname "dynerf/flame_steak" \
-    --configs arguments/dynerf/flame_steak.py \
-    --test_iterations 13001 \
-    --save_iterations 13001 \
-    2>&1 | tee "$RESULTS/Swift4D/flame_steak/training_log.txt")
-log "Step 3 — Swift4D training DONE."
-
-# ─── STEP 4: Swift4D render + quality ─────────────────────────────────────
-log "Step 4 — Swift4D render + metrics ..."
-(cd "$GLASS_DIR/baselines/Swift4D" &&
- SWIFT4D_MODEL="$(ls -dt output/dynerf/flame_steak 2>/dev/null | head -1)"
- if [ -n "$SWIFT4D_MODEL" ]; then
-     conda run --no-capture-output -n "$QUEEN_ENV" \
-         python render.py \
-         --model_path "$SWIFT4D_MODEL" \
-         --skip_train --skip_video \
-         --iteration 13000 \
-         --configs arguments/dynerf/flame_steak.py \
-         2>&1 | tee "$RESULTS/Swift4D/flame_steak/render_log.txt"
-
-     conda run --no-capture-output -n "$QUEEN_ENV" \
-         python metrics.py \
-         --model_path "$SWIFT4D_MODEL" \
-         2>&1 | tee "$RESULTS/Swift4D/flame_steak/metrics_log.txt"
- else
-     log "  Swift4D model directory not found; skipping render + metrics."
- fi)
-log "Step 4 — Swift4D eval DONE."
-
-# ─── STEP 5: HiCoM training ───────────────────────────────────────────────
-log "Step 5 — HiCoM training ..."
+# ─── STEP 3: HiCoM training ───────────────────────────────────────────────
+log "Step 3 — HiCoM training ..."
 mkdir -p "$RESULTS/HiCoM/flame_steak"
 (cd "$GLASS_DIR/baselines/HiCoM" &&
  conda run --no-capture-output -n "$HICOM_ENV" \
@@ -100,18 +65,18 @@ mkdir -p "$RESULTS/HiCoM/flame_steak"
     "experiment_name=flame_steak" \
     "trainer.num_incr_steps=200" \
     2>&1 | tee "$RESULTS/HiCoM/flame_steak/training_log.txt")
-log "Step 5 — HiCoM training DONE."
+log "Step 3 — HiCoM training DONE."
 
-# ─── STEP 6: QUEEN (reuses prior-run subset, no retraining) ───────────────
-log "Step 6 — QUEEN FPS measurement (quality from prior-run subset) ..."
+# ─── STEP 4: QUEEN (reuses prior-run subset, no retraining) ───────────────
+log "Step 4 — QUEEN FPS measurement (quality from prior-run subset) ..."
 mkdir -p "$RESULTS/QUEEN"
 conda run --no-capture-output -n "$QUEEN_ENV" \
     python "$SCRIPTS/bench_queen.py" \
     2>&1 | tee "$RESULTS/QUEEN/bench_log.txt"
-log "Step 6 — QUEEN DONE."
+log "Step 4 — QUEEN DONE."
 
-# ─── STEP 7: Aggregate ────────────────────────────────────────────────────
-log "Step 7 — aggregating all results ..."
+# ─── STEP 5: Aggregate ────────────────────────────────────────────────────
+log "Step 5 — aggregating all results ..."
 conda run --no-capture-output -n "$DGS_ENV" \
     python "$SCRIPTS/collect_metrics.py" \
     2>&1 | tee "$RESULTS/metric_table.log"
