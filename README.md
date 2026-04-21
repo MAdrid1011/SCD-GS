@@ -1,6 +1,6 @@
 # GLASS — Live-State Dataflow Architecture for Streamable Gaussian Systems
 
-A Python ASIC simulator for an edge accelerator that trains streamable Gaussian Splatting models frame-by-frame. The simulator measures cycle counts, memory traffic, and quality of four progressive ablation configurations (Mode 0 – Mode 3) across four published baselines: **QUEEN**, **3DGStream**, **HiCoM**, and **Swift4D**.
+A Python ASIC simulator for an edge accelerator that trains streamable Gaussian Splatting models frame-by-frame. The simulator measures cycle counts, memory traffic, and quality of four progressive ablation configurations (Mode 0 – Mode 3) across four published baselines: **QUEEN**, **3DGStream**, **HiCoM**, and **4DGC**.
 
 ---
 
@@ -38,7 +38,7 @@ GLASS/
 │   │   ├── op_queen.py          QUEEN — latent-decoder + gate
 │   │   ├── op_3dgstream.py      3DGStream — NTC delta-norm ingestion
 │   │   ├── op_hicom.py          HiCoM — hierarchical commit
-│   │   └── op_swift4d.py        Swift4D — 4D Gaussian scaffold
+│   │   └── op_4dgc.py           4DGC — Motion_Grid MEM + entropy bottleneck
 │   ├── metrics/
 │   │   └── collector.py         PSNR / SSIM / LPIPS / FPS / storage
 │   └── ablation/                per-baseline runner scripts (in PR #4)
@@ -47,7 +47,7 @@ GLASS/
 │   ├── QUEEN                    @ NVlabs/queen
 │   ├── 3DGStream                @ SJoJoK/3DGStream
 │   ├── HiCoM                    @ gqk/HiCoM
-│   └── Swift4D                  @ WuJH2001/swift4d
+│   └── 4DGC                     @ qianghu-huber/4DGC
 ├── data/                        datasets + pre-trained init weights  (gitignored)
 └── results/                     ablation outputs  (gitignored)
 ```
@@ -93,13 +93,19 @@ Results land in `results/GLASS_ablation/<scene>/<BASELINE>/mode_<N>.json`.
 cat results/GLASS_ablation/flame_steak/QUEEN/mode_1.json
 ```
 
-Key fields:
-- `avg_train_time_s` — GPU wall-clock per incremental frame
-- `asic_train_time_s` — ASIC incremental-training time at `ASICSpec.clock_hz` (default 1 GHz)
+Key fields (canonical key order in `simulator/ablation/result_schema.py`):
+- `asic_train_time_s` — headline: ASIC incremental-training time per frame at `ASICSpec.clock_hz` (default 1 GHz)
+- `asic_commit_time_s` — commit-path only (`gradient_pipeline + optimizer`); isolates Mode 0→1→2 movement
 - `psnr` / `ssim` / `lpips` — averaged over all test cameras on all trained frames
-- `render_fps` — measured post-training, with Mode-2+ tier mask active
-- `frame_suppression_ratio` — fraction of bytes UCN suppressed
+- `render_fps` — ASIC-modelled FPS via `add_render_inference` on the mode-aware masked proxy
+- `render_fps_gpu_measured` — GPU wall-clock FPS on the same proxy (diagnostic)
+- `total_storage_mb` / `delta_storage_mb` — final checkpoint + run-level incremental stream
+- `frame_*` / `run_*` bytes and `*_suppression_ratio` — UCN evidence (Challenge 1)
+- `n_asc_rsb` / `n_css` / `n_known` / `n_total` — LiveStateFabric residency (Challenge 2)
+- `base_train_iters` / `avg_train_iters` / `per_frame_train_iters` — per-frame training-iter schedule (null for QUEEN's monolithic `opt.iterations`)
 - `asic_<unit>_cycles` — per-unit totals; see [`docs/cycle_accounting.md`](docs/cycle_accounting.md)
+
+GPU wall-clock timings are deliberately not written — they are simulator-host artefacts, not ASIC properties. Older result JSONs can be migrated in place with `python -m simulator.ablation.migrate_results`.
 
 ---
 

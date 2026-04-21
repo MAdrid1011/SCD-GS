@@ -15,7 +15,6 @@ name: meet_room
 source_path_3dgstream: data/meet_room/meet_room
 source_path_queen:      data/meet_room/meet_room
 source_path_hicom:      data/meet_room/hicom_meet_room_scene
-source_path_swift4d:    data/meet_room/meet_room
 init_model_3dgstream:   data/meet_room/3dgstream_meet_room_scene
 n_frames_ablation: 30
 extra_args:
@@ -27,10 +26,6 @@ extra_args:
     max_frames: 30
   hicom:
     trainer.num_incr_steps: 200
-  swift4d:
-    configs: arguments/dynerf/meet_room.py
-    test_iterations: "1000"
-    save_iterations: "1000"
 """
 from __future__ import annotations
 
@@ -69,7 +64,7 @@ class DatasetConfig:
     source_path_3dgstream: str = ""   # COLMAP frame* sub-directory layout
     source_path_queen:     str = ""   # cam*/ multi-camera layout
     source_path_hicom:     str = ""   # libgs-compatible layout
-    source_path_swift4d:   str = ""   # DyNeRF / COLMAP layout
+    source_path_4dgc:      str = ""   # COLMAP colmap_* sub-directory layout
 
     # ── Pre-trained frame-0 model roots ──────────────────────────────────────
     # 3DGStream: the output directory written by a prior train.py run; the
@@ -82,6 +77,13 @@ class DatasetConfig:
     init_model_3dgstream: str = ""
     init_model_hicom:     str = ""
     init_model_queen:     str = ""
+    # 4DGC: directory produced by train_initial.py (contains cfg_args.json
+    #   + point_cloud/iteration_<N>/point_cloud.ply); the runner passes this
+    #   to Scene(..., load_iteration=first_load_iteration).
+    # init_mem_4dgc: .pth file produced by scripts/Motion_Grid_warmup.py; the
+    #   runner passes this via args.mem_path to OptimizationParams.
+    init_model_4dgc:      str = ""
+    init_mem_4dgc:        str = ""
 
     # ── Ablation training scope ───────────────────────────────────────────────
     n_frames_ablation: int = 30
@@ -93,7 +95,7 @@ class DatasetConfig:
     fps_measure: int = 50
 
     # ── Per-model extra arguments ─────────────────────────────────────────────
-    # Keys: "3dgstream", "queen", "hicom", "swift4d"
+    # Keys: "3dgstream", "queen", "hicom", "4dgc"
     # Values: dict of argparse-style kwarg overrides forwarded to each baseline.
     # Boolean flags are expressed as True/False (converted to store_true args).
     extra_args: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -121,7 +123,9 @@ DATASET_REGISTRY: dict[str, DatasetConfig] = {
         source_path_3dgstream="data/3dgstream_flame_steak_scene",
         source_path_queen    ="data/flame_steak/flame_steak",
         source_path_hicom    ="data/hicom_flame_steak_scene",
-        source_path_swift4d  ="data/flame_steak/flame_steak",
+        # 4DGC expects ``colmap_<k>`` folder naming (vs 3DGStream's
+        # ``frame<k>``), each with its own ``images/`` sub-dir.
+        source_path_4dgc     ="data/4dgc_flame_steak_scene",
         # Pre-trained init models — all paths relative to GLASS_DIR.
         init_model_3dgstream ="data/flame_steak/3dgstream_init",
         # HiCoM frame-0 checkpoint (gaussians + deformation + global_step=15000)
@@ -132,6 +136,15 @@ DATASET_REGISTRY: dict[str, DatasetConfig] = {
         # QUEEN Frame-1 PLY (188 K Gaussians, 9 995-iter checkpoint).
         # run_queen.py loads this and starts incremental training from frame 2.
         init_model_queen     ="data/flame_steak/queen_init",
+        # 4DGC init artifacts (both produced once per scene):
+        #   • init_model_4dgc: run ``python train_initial.py \
+        #       -s data/4dgc_flame_steak_scene/colmap_0 \
+        #       -m data/flame_steak/4dgc_init --eval``
+        #   • init_mem_4dgc:   run ``cd baselines/4DGC/scripts && \
+        #       python Motion_Grid_warmup.py --pcd_pth <init/point_cloud.ply> \
+        #       --q 1 --output_path data/flame_steak/4dgc_init/mem.pth``
+        init_model_4dgc      ="data/flame_steak/4dgc_init",
+        init_mem_4dgc        ="data/flame_steak/4dgc_init/mem.pth",
         n_frames_ablation    =30,
         fps_warmup  =5,
         fps_measure =50,
@@ -169,11 +182,28 @@ DATASET_REGISTRY: dict[str, DatasetConfig] = {
                 "trainer.num_incr_steps": 200,
                 "trainer.num_init_steps": 15000,
             },
-            "swift4d": {
-                "configs":         "arguments/dynerf/flame_steak.py",
-                "test_iterations": "1000 3000 5000 7000 9000 11000 13001",
-                "save_iterations": "13001",
-                "expname":         "dynerf/flame_steak",
+            "4dgc": {
+                # Frame-0 init model was produced by train_initial.py at
+                # SH degree 1 (first_load_iteration matches its save iter).
+                "sh_degree":            1,
+                # Stage 1 (MEM) per-frame iterations — kept small (= 3DGStream
+                # scale) because the MEM converges fast on a warmed-up grid.
+                "iterations":           100,
+                # Stage 2 (compensated Gaussians) per-frame iterations.
+                "iterations_s2":        100,
+                # iter to load ``point_cloud/iteration_<N>/point_cloud.ply``
+                # from init_model_4dgc.  Must match the save iter of the
+                # train_initial.py run — verify cfg_args.json if changing.
+                "first_load_iteration": 10000,
+                "frame_start":          1,
+                "batch_size":           1,
+                "q":                    1,
+                # Enable Stage-2 densify/spawn/clone (the 4DGC default in
+                # train_frames.py is False — the paper's supplementary shows
+                # s2_adding=True consistently improves PSNR).
+                "s2_adding":            True,
+                # Disable in-training eval (GLASS measures quality separately).
+                "test_iterations":      [],
             },
         },
     ),
@@ -184,7 +214,6 @@ DATASET_REGISTRY: dict[str, DatasetConfig] = {
     #     source_path_3dgstream="data/meet_room/meet_room",
     #     source_path_queen    ="data/meet_room/meet_room",
     #     source_path_hicom    ="data/hicom_meet_room_scene",
-    #     source_path_swift4d  ="data/meet_room/meet_room",
     #     init_model_3dgstream ="data/meet_room/3dgstream_scene",
     #     n_frames_ablation    =30,
     #     extra_args={ ... },

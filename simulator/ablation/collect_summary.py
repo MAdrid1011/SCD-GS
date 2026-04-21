@@ -10,24 +10,23 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from simulator.ablation.result_schema import MODE_LABELS
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ABL_ROOT  = REPO_ROOT / "results" / "GLASS_ablation" / "flame_steak"
-BASELINES = ["3DGStream", "QUEEN", "HiCoM"]
+BASELINES = ["3DGStream", "QUEEN", "HiCoM", "4DGC"]
 MODES     = [0, 1, 2, 3]
 
-MODE_LABELS = {
-    0: "M0 (PUOE)",
-    1: "M1 (+UCN)",
-    2: "M2 (+ILSF)",
-    3: "M3 (+Salience)",
-}
-
+# Columns intentionally omit GPU wall-clock (simulator-host artefact)
+# and ``asic_commit_time_s`` (a sub-component of the headline
+# ``asic_train_time_s``; exposing both in the summary invites readers
+# to add them, and the delta between modes is already visible in the
+# headline column).  ``asic_commit_time_s`` is still emitted in every
+# ``mode_*.json`` for diagnostic decomposition.
 COLUMNS = [
     ("mode",               "Mode"),
     ("n_frames_trained",   "Frames"),
-    ("avg_train_time_s",   "GPU train/frame (s)"),
     ("asic_train_time_s",  "ASIC train/frame (s)"),
-    ("asic_commit_time_s", "ASIC commit (s)"),
     ("render_fps",         "Render FPS"),
     ("psnr",               "PSNR"),
     ("ssim",               "SSIM"),
@@ -48,9 +47,7 @@ def fmt(val, key):
             return f"{val:6.4f}"
         if key in ("render_fps",):
             return f"{val:7.1f}"
-        if key in ("avg_train_time_s",):
-            return f"{val:6.1f}"
-        if key in ("asic_train_time_s", "asic_commit_time_s"):
+        if key in ("asic_train_time_s",):
             return f"{val:7.3f}"
         if key in ("total_storage_mb", "delta_storage_mb"):
             return f"{val:9.2f}"
@@ -79,11 +76,11 @@ def as_markdown(table: dict) -> str:
     lines: list[str] = []
     lines.append("# GLASS ASIC Ablation — flame_steak (10 frames)\n")
     lines.append(
-        "| Baseline | Mode | Frames | GPU train/frame (s) | ASIC train/frame (s) "
-        "| ASIC commit (s) | Render FPS | PSNR | SSIM | LPIPS | Total storage (MB) | Δ stream (MB) |"
+        "| Baseline | Mode | Frames | ASIC train/frame (s) "
+        "| Render FPS | PSNR | SSIM | LPIPS | Total storage (MB) | Δ stream (MB) |"
     )
     lines.append(
-        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|"
     )
     for baseline in BASELINES:
         for m in MODES:
@@ -94,9 +91,7 @@ def as_markdown(table: dict) -> str:
                 baseline,
                 MODE_LABELS[m],
                 fmt(entry.get("n_frames_trained"), "n_frames_trained"),
-                fmt(entry.get("avg_train_time_s"), "avg_train_time_s"),
                 fmt(entry.get("asic_train_time_s"), "asic_train_time_s"),
-                fmt(entry.get("asic_commit_time_s"), "asic_commit_time_s"),
                 fmt(entry.get("render_fps"), "render_fps"),
                 fmt(entry.get("psnr"), "psnr"),
                 fmt(entry.get("ssim"), "ssim"),

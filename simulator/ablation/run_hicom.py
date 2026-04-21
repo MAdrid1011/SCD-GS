@@ -37,6 +37,7 @@ BASELINE_DIR = GLASS_DIR / "baselines" / "HiCoM"
 sys.path.insert(0, str(GLASS_DIR))
 sys.path.insert(0, str(BASELINE_DIR))
 
+from simulator.ablation.result_schema import build_result
 from simulator.config import ASICConfig
 from simulator.datasets import load_dataset_config
 from simulator.metrics.collector import MetricsCollector
@@ -238,17 +239,15 @@ def run_one_mode(mode: int, ds_cfg, n_frames: int | None = None) -> dict:
     # ── FPS measurement ───────────────────────────────────────────────────────
     print("  Measuring FPS …")
     fps = 0.0
+    fps_diag: dict = {}
     gaussians = None
     try:
         module = _state["module"]
-        # Re-install hooks *before* get_gaussians(), since uninstall_hooks()
-        # above cleared slot._module and _MergedGaussianAccessor needs it.
         if module is not None:
             slot.install_hooks(pipeline, trainer=_state["trainer"], module=module)
             gaussians = slot.get_gaussians()
         if gaussians is not None:
 
-            # Use validation dataloader cameras
             val_loaders = module.datamodule.val_dataloader()
             if not isinstance(val_loaders, (list, tuple)):
                 val_loaders = [val_loaders]
@@ -256,15 +255,6 @@ def run_one_mode(mode: int, ds_cfg, n_frames: int | None = None) -> dict:
 
             if val_cams:
                 def _render_fn(cam, g, pipe_, bg):
-                    # Temporarily point the renderer at the MaskedGaussianProxy
-                    # (``g``) built by ``pipeline.make_render_proxy()`` so the
-                    # fabric render mask (mode >= 2) and salience keep-mask
-                    # (mode >= 3) actually shape the rasterised workload.
-                    # ``module.forward`` itself never rebinds
-                    # ``self.renderer.gaussians`` (only ``pre_training_step``
-                    # does, and that is not called during inference), so a
-                    # simple try/finally swap is race-free.  Mode 0 / 1 pass
-                    # the unmasked proxy, so their render cost is unchanged.
                     renderer = module.renderer
                     saved    = renderer.gaussians
                     renderer.gaussians = g
@@ -273,17 +263,12 @@ def run_one_mode(mode: int, ds_cfg, n_frames: int | None = None) -> dict:
                     finally:
                         renderer.gaussians = saved
 
-                fps = collector.measure_fps(
-                    pipeline,
+                fps_diag = pipeline.measure_asic_render_fps(
                     _render_fn,
                     val_cams, None, None,
+                    sh_degree=int(getattr(gaussians, "active_sh_degree", 3)),
                 )
-                # Back-calc render cycles from measured FPS so that
-                # cycle_summary() reports ``asic_render_cycles`` / the
-                # ASIC equivalents — no magic numbers, sourced from the
-                # spec clock_hz.
-                if fps > 0:
-                    pipeline.set_render_cycles_from_fps(fps)
+                fps = fps_diag["asic_fps"]
             slot.uninstall_hooks()
     except Exception as e:
         print(f"  FPS measurement failed: {e}")
@@ -316,38 +301,37 @@ def run_one_mode(mode: int, ds_cfg, n_frames: int | None = None) -> dict:
     stats         = pipeline.stream_stats(n_gaussians=_n_gaussians_for_stats)
     cycle_summary = pipeline.cycle_summary()
 
-    result = {
-        "mode":             mode,
-        "baseline":         "HiCoM",
-        "dataset":          ds_cfg.name,
-        "n_frames_trained": len(per_frame_delta_bytes),
-        "avg_train_time_s": collector.avg_frame_time(),
-        "render_fps":       fps,
-        **quality,
-        "total_storage_mb": total_storage_mb,
-        "delta_storage_mb": delta_storage_mb,
-        **stats,
-        "incremental":      True,
-        **cycle_summary,
-        # asic_commit_time_s: gradient pipeline + optimizer only (mirrors
-        # run_queen / run_3dgstream convention).  Minimal view for
-        # mode 0 → 1 → 2 → 3 comparison of the commit path alone.
-        "asic_commit_time_s": (
-            cycle_summary.get("asic_gradient_pipeline_cycles", 0)
-            + cycle_summary.get("asic_optimizer_cycles", 0)
-        ) / config.asic_spec.clock_hz,
-        # asic_train_time_s: full ASIC incremental training time per frame.
-        #   = n_iters × (render + loss + backward) cycles (from
-        #                 add_gaussian_training_iters)
-        #   + gradient pipeline  (PUOE / ICE etc.)
-        #   + optimizer          (Adam on active Gaussians)
-        # Directly comparable to ``avg_train_time_s`` (GPU wall-clock).
-        "asic_train_time_s": (
-            cycle_summary.get("asic_ntc_train_render_cycles", 0)
-            + cycle_summary.get("asic_gradient_pipeline_cycles", 0)
-            + cycle_summary.get("asic_optimizer_cycles", 0)
-        ) / config.asic_spec.clock_hz,
-    }
+    # asic_train_time_s: full ASIC incremental training time per frame.
+    #   = n_iters × (render + loss + backward) cycles (from
+    #                 add_gaussian_training_iters)
+    #   + gradient pipeline  (PUOE / ICE etc.)
+    #   + optimizer          (Adam on active Gaussians)
+    asic_train_time_s = (
+        cycle_summary.get("asic_ntc_train_render_cycles", 0)
+        + cycle_summary.get("asic_gradient_pipeline_cycles", 0)
+        + cycle_summary.get("asic_optimizer_cycles", 0)
+    ) / config.asic_spec.clock_hz
+
+    avg_train_iters = (sum(per_frame_iter_counts) / len(per_frame_iter_counts)
+                       if per_frame_iter_counts else n_iters_per_frame)
+
+    result = build_result(
+        baseline="HiCoM",
+        dataset=ds_cfg.name,
+        mode=mode,
+        n_frames_trained=len(per_frame_delta_bytes),
+        quality=quality,
+        render_fps=fps,
+        total_storage_mb=total_storage_mb,
+        delta_storage_mb=delta_storage_mb,
+        asic_train_time_s=asic_train_time_s,
+        cycle_summary=cycle_summary,
+        stream_stats=stats,
+        fps_diagnostic=fps_diag,
+        base_train_iters=n_iters_per_frame,
+        avg_train_iters=avg_train_iters,
+        per_frame_train_iters=per_frame_iter_counts,
+    )
 
     out_path = GLASS_DIR / "results" / "GLASS_ablation" / ds_cfg.name / "HiCoM"
     out_path.mkdir(parents=True, exist_ok=True)

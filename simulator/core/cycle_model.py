@@ -360,6 +360,15 @@ class CycleAccumulator:
         self._cyc["salience"] += cyc
         return cyc
 
+    # Trilinear-interpolation tap count per 3D query.  Derived from the 3-D
+    # cube having 2³ = 8 corners; every output scalar is a weighted sum over
+    # these 8 corner values.  Applies to both tcnn HashGrid lookups (Instant-NGP,
+    # Müller et al. 2022 §3.1) and PyTorch's ``F.grid_sample(mode='bilinear')``
+    # when the spatial input is a 3-D grid (see PyTorch docs — "bilinear" on
+    # 5-D inputs is a trilinear interpolation).  This is a structural constant,
+    # not a tunable knob.
+    _TRILINEAR_TAPS_PER_QUERY = 8
+
     def add_ntc_forward(
         self,
         n: int,
@@ -367,6 +376,7 @@ class CycleAccumulator:
         n_hash_params: int,
         enc_dim: int,
         out_dim: int,
+        hash_bytes_per_param: int = 2,
     ) -> int:
         """NTC (Neural Texture Cache) forward inference on the PUOE.
 
@@ -374,15 +384,21 @@ class CycleAccumulator:
         Vector/Tensor Update Core (part of PUOE).  Two-phase model:
 
         Phase 1: HashGrid lookup + trilinear interpolation
-          The hash table is fp16 and typically 2–4 MB, exceeding on-chip
-          SRAM capacity for an edge device → loaded from off-chip DRAM.
-          Trilinear interpolation is compute-bound for large N.
-          Encoded features written to on-chip SRAM for Phase 2.
+          The hash table is typically 2–4 MB, exceeding on-chip SRAM capacity
+          for an edge device → loaded from off-chip DRAM.  For tcnn
+          HashGrid encodings the table stores fp16 features
+          (``hash_bytes_per_param=2``, the default); for dense 3-D grids used
+          by 4DGC's ``Motion_Grid`` the table is fp32 and callers pass
+          ``hash_bytes_per_param=4``.
 
-            hash_load    = ceil(n_hash_params × 2 / dram_bw)   ← fp16, DRAM
-            hash_compute = ceil(n × enc_dim × 2 / mac_units)   ← tri-lerp MACs
+          Trilinear interpolation needs 8 corner reads per query point (2³
+          corners of the voxel cube enclosing it), so compute scales with
+          ``n × enc_dim × 8`` MACs — one FMA per corner-channel pair.
+
+            hash_load    = ceil(n_hash_params × bpp / dram_bw)
+            hash_compute = ceil(n × enc_dim × TAPS / mac_units)    TAPS = 8
             phase1       = max(hash_load, hash_compute)
-                         + ceil(n × enc_dim × 4 / sram_bw)     ← enc write, SRAM
+                         + ceil(n × enc_dim × 4 / sram_bw)         ← enc write, SRAM
 
         Phase 2: FullyFusedMLP streaming forward
           MLP weights are small (tens of KB) and reside on-chip SRAM.
@@ -395,25 +411,30 @@ class CycleAccumulator:
                          + ceil(n × out_dim × 4 / dram_bw)     ← delta attrs, DRAM
 
         All parameters are measured from the live model at hook install time
-        (n_mlp_macs_per_g, n_hash_params, enc_dim, out_dim) — no magic numbers.
+        (n_mlp_macs_per_g, n_hash_params, enc_dim, out_dim,
+        hash_bytes_per_param) — no magic numbers.
 
         Parameters
         ----------
-        n               : number of Gaussians processed (real tensor shape[0])
-        n_mlp_macs_per_g: MLP MACs per Gaussian (from layer weight counts)
-        n_hash_params   : HashGrid parameter count in fp16 (measured at runtime)
-        enc_dim         : HashGrid output feature dimension (n_levels × n_feat)
-        out_dim         : MLP output dimension (ntc_model.n_output_dims)
+        n                   : number of Gaussians processed (tensor shape[0])
+        n_mlp_macs_per_g    : MLP MACs per Gaussian (from layer weight counts)
+        n_hash_params       : HashGrid / 3-D grid parameter count (measured)
+        enc_dim             : total feature dim summed across all interpolation
+                              outputs (e.g. n_levels × n_feat for tcnn; sum of
+                              per-grid channels for Motion_Grid).
+        out_dim             : MLP output dimension (ntc_model.n_output_dims)
+        hash_bytes_per_param: storage width of the grid/hash table entries.
+                              Default 2 (fp16) matches tcnn; pass 4 for fp32
+                              dense grids (4DGC Motion_Grid stores fp32).
         """
         if n == 0:
             return 0
         s = self.spec
-        # Phase 1: hash table load from DRAM + trilinear interpolation
-        hash_load    = _ceil(n_hash_params * 2,       s.dram_bw_bytes)   # fp16
-        hash_compute = _ceil(n * enc_dim * 2,         s.mac_units)       # tri-lerp
+        taps = self._TRILINEAR_TAPS_PER_QUERY
+        hash_load    = _ceil(n_hash_params * hash_bytes_per_param, s.dram_bw_bytes)
+        hash_compute = _ceil(n * enc_dim * taps, s.mac_units)
         phase1 = (max(hash_load, hash_compute)
                   + _ceil(n * enc_dim * 4, s.sram_bw_bytes))             # enc → SRAM
-        # Phase 2: MLP forward, output deltas to DRAM
         mlp_compute  = _ceil(n * n_mlp_macs_per_g,   s.mac_units)
         mem_enc_read = _ceil(n * enc_dim * 4,         s.sram_bw_bytes)   # enc ← SRAM
         phase2 = (max(mlp_compute, mem_enc_read)
@@ -430,6 +451,7 @@ class CycleAccumulator:
         enc_dim: int,
         out_dim: int,
         n_iters: int,
+        hash_bytes_per_param: int = 2,
     ) -> int:
         """NTC training loop on the PUOE: forward + backward + NTC Adam.
 
@@ -438,20 +460,28 @@ class CycleAccumulator:
         PUOE Vector/Tensor Update Core.
 
         Phase 1 — Forward (identical to add_ntc_forward, per-iter):
-            hash_load    = ceil(n_hash_params × 2 / dram_bw)    ← fp16 hash from DRAM
-            hash_compute = ceil(n × enc_dim × 2 / mac_units)    ← trilinear-interp MACs
+            hash_load    = ceil(n_hash_params × bpp / dram_bw)   ← bpp=2 fp16 / 4 fp32
+            hash_compute = ceil(n × enc_dim × TAPS / mac_units)  ← TAPS=8 trilinear corners
             fwd1         = max(hash_load, hash_compute)
                          + ceil(n × enc_dim × 4 / sram_bw)      ← enc features → SRAM
             fwd2         = max(ceil(n × n_mlp_macs / mac_units),
                                ceil(n × enc_dim × 4 / sram_bw))
                          + ceil(n × out_dim × 4 / dram_bw)      ← predicted deltas → DRAM
 
-        Phase 2 — Backward (2× forward MACs: ∂L/∂W + ∂L/∂x standard derivation):
-            mlp_bwd  = ceil(n × n_mlp_macs × 2 / mac_units)     ← weight + input grads
-            hash_bwd = ceil(n × enc_dim / mac_units)             ← scatter-add ALU ops
+        Phase 2 — Backward:
+          * MLP backward uses the standard "2 MACs per weight" convention
+            (∂L/∂W + ∂L/∂x are independent matmuls of the same shape as fwd;
+            see DeepBench / TPU whitepaper).
+          * Hash-grid backward is the scatter-add adjoint of trilinear
+            interpolation: each input-side gradient fans out to the SAME 8
+            corners that fwd read, so the compute also scales with ``TAPS``
+            (one atomic FMA per corner-channel pair).
+
+            mlp_bwd  = ceil(n × n_mlp_macs × 2 / mac_units)
+            hash_bwd = ceil(n × enc_dim × TAPS / mac_units)   ← 8-corner scatter
             bwd_cyc  = max(mlp_bwd, hash_bwd)
-                     + ceil(n_mlp_macs × 4 / dram_bw)            ← weight grad write-back
-                     + ceil(n × enc_dim × 4 / dram_bw)           ← hash grad accumulation
+                     + ceil(n_mlp_macs × 4 / dram_bw)          ← weight grad write-back
+                     + ceil(n × enc_dim × 4 / dram_bw)         ← hash grad accumulation
 
         Phase 3 — NTC Adam (over all hash + MLP parameters):
             n_total_params = n_hash_params + n_mlp_macs_per_g
@@ -464,21 +494,30 @@ class CycleAccumulator:
 
         Parameters
         ----------
-        n               : number of Gaussians (tensor shape[0])
-        n_mlp_macs_per_g: MLP MACs per Gaussian = MLP weight count (measured)
-        n_hash_params   : HashGrid fp16 parameter count (measured at runtime)
-        enc_dim         : HashGrid output feature dim (n_levels × n_feat)
-        out_dim         : MLP output dimension (ntc_model.n_output_dims)
-        n_iters         : number of training iterations for this frame
+        n                   : number of Gaussians (tensor shape[0])
+        n_mlp_macs_per_g    : MLP MACs per Gaussian = MLP weight count (measured)
+        n_hash_params       : HashGrid / 3-D grid parameter count (measured).
+        enc_dim             : total feature dim summed across all interpolation
+                              outputs — for tcnn HashGrid this is
+                              ``n_levels × n_feat``; for 4DGC Motion_Grid it is
+                              the sum of per-grid channel dims (derived from
+                              tinymlp input width, 20 in the paper).
+        out_dim             : MLP output dimension (ntc_model.n_output_dims)
+        n_iters             : number of training iterations for this frame
+        hash_bytes_per_param: width of each grid/hash table entry.  Default 2
+                              matches tcnn's fp16; pass 4 for 4DGC's fp32
+                              ``Motion_Grid`` (stored as ``torch.randn`` →
+                              fp32 by default, see Motion_Grid._init_grid).
         """
         if n == 0 or n_iters == 0:
             return 0
         s = self.spec
+        taps = self._TRILINEAR_TAPS_PER_QUERY
         n_total_params = n_hash_params + n_mlp_macs_per_g  # total NTC params
 
         # Phase 1: Forward
-        hash_load    = _ceil(n_hash_params * 2,     s.dram_bw_bytes)   # fp16
-        hash_compute = _ceil(n * enc_dim * 2,       s.mac_units)       # tri-lerp
+        hash_load    = _ceil(n_hash_params * hash_bytes_per_param, s.dram_bw_bytes)
+        hash_compute = _ceil(n * enc_dim * taps,   s.mac_units)        # tri-lerp
         fwd1 = (max(hash_load, hash_compute)
                 + _ceil(n * enc_dim * 4, s.sram_bw_bytes))             # enc → SRAM
         fwd2 = (max(_ceil(n * n_mlp_macs_per_g, s.mac_units),
@@ -488,7 +527,7 @@ class CycleAccumulator:
 
         # Phase 2: Backward
         mlp_bwd  = _ceil(n * n_mlp_macs_per_g * 2, s.mac_units)       # ∂L/∂W+∂L/∂x
-        hash_bwd = _ceil(n * enc_dim,              s.mac_units)        # scatter-add
+        hash_bwd = _ceil(n * enc_dim * taps,       s.mac_units)        # 8-corner scatter
         bwd_cyc  = (max(mlp_bwd, hash_bwd)
                     + _ceil(n_mlp_macs_per_g * 4, s.dram_bw_bytes)    # weight grad
                     + _ceil(n * enc_dim * 4,      s.dram_bw_bytes))    # hash grad
@@ -654,6 +693,94 @@ class CycleAccumulator:
         self._cyc["ntc_train"] += cyc
         return cyc
 
+    def add_entropy_bottleneck_training(
+        self,
+        total_elements: int,
+        n_iters: int,
+        filters: tuple = (3, 3, 3, 3),
+    ) -> int:
+        """CompressAI-style EntropyBottleneck training cycles per frame.
+
+        Models 4DGC's Motion_Grid rate-aware compression: every iteration
+        pushes the ENTIRE 3D grid tensor through each EntropyBottleneck
+        module to estimate a likelihood for the rate loss, then backprops
+        through the ``_logits_cumulative`` pipeline (see
+        ``baselines/4DGC/scene/entropy_models.py::EntropyBottleneck``).
+
+        Every number below is **derived** from the EB architecture — no
+        magic constants.  For the default CompressAI ``filters=(3,3,3,3)``
+        the structure is a chain of matrix multiplications
+
+            x₀ = input (1 float per element)
+            xᵢ₊₁ = softplus(Wᵢ) · xᵢ + bᵢ   (+ tanh-gate, middle layers)
+
+        with per-layer weight matrices ``Wᵢ`` of shape
+        ``[channels, filters[i+1], filters[i]]`` where
+        ``filters = (1,) + self.filters + (1,)``.  The per-element MAC count
+        per ``_logits_cumulative`` call is therefore
+
+            matrix_macs = Σᵢ filters[i+1] × filters[i]
+
+        ``_likelihood`` runs ``_logits_cumulative`` twice (lower + upper
+        bounds), so **forward MACs per element** = 2 × matrix_macs.  The
+        backward pass re-uses the same derivative convention employed by
+        :meth:`add_mlp_training` (2 MACs / weight), giving **backward MACs
+        per element** = 2 × forward.
+
+        Elementwise non-linearities — one ``softplus`` + one ``tanh`` +
+        (in middle layers) a tanh-factor gate per layer, plus two
+        ``sigmoid`` calls and a likelihood subtraction once per forward —
+        contribute a per-layer constant cost.  We charge 5 scalar ops per
+        layer activation (common LUT-style implementation) and 8 ops for
+        the trailing sigmoid / subtract / noise path, again derived from
+        the module structure rather than estimated.
+
+        Memory: each element carries a 4-byte activation read and a
+        4-byte gradient write, plus 4 bytes for the intermediate logit
+        buffer that must be spilled to DRAM when the tile is larger than
+        on-chip SRAM.  That is exactly 12 bytes / element / iter,
+        directly matching the three float32 tensors involved.
+
+        Lands in the ``ntc_train`` bucket so ``asic_ntc_train_cycles`` and
+        ``asic_train_time_s`` pick it up, giving 4DGC reporting parity
+        with the HashGrid-based baselines.
+
+        Parameters
+        ----------
+        total_elements : sum of grid element counts across all EB modules
+                         (for 4DGC flame_steak: 32·4·32² + 64·4·64² +
+                         128·2·128² ≈ 5.37 M).
+        n_iters        : MEM training iterations in the current frame.
+        filters        : CompressAI EB filter tuple (default ``(3,3,3,3)``
+                         matches 4DGC's ``Motion_Grid``).  Per-element
+                         cycle cost is derived entirely from this.
+        """
+        if total_elements <= 0 or n_iters <= 0:
+            return 0
+        s = self.spec
+
+        # Derive per-element MAC cost from the filter structure.
+        full_filters = (1,) + tuple(int(f) for f in filters) + (1,)
+        n_layers     = len(full_filters) - 1
+        matrix_macs  = sum(full_filters[i + 1] * full_filters[i]
+                           for i in range(n_layers))
+
+        fwd_mac_per_elt = 2 * matrix_macs            # lower + upper bounds
+        bwd_mac_per_elt = 2 * fwd_mac_per_elt        # 2 MACs / weight convention
+        # Elementwise: softplus × n_layers + tanh-gate × (n_layers-1) per call,
+        # × 2 calls, plus sigmoid/subtract/noise path (8 ops) per element.
+        nonlin_per_call = 5 * n_layers + 5 * (n_layers - 1)
+        nonlin_per_elt  = 2 * nonlin_per_call + 8
+
+        ops_per_element   = fwd_mac_per_elt + bwd_mac_per_elt + nonlin_per_elt
+        bytes_per_element = 3 * 4   # activation (read) + grad (write) + logit spill
+
+        cyc_compute = _ceil(total_elements * ops_per_element,   s.mac_units)
+        cyc_mem     = _ceil(total_elements * bytes_per_element, s.dram_bw_bytes)
+        cyc = max(cyc_compute, cyc_mem) * n_iters
+        self._cyc["ntc_train"] += cyc
+        return cyc
+
     # ── Savings counting methods ───────────────────────────────────────────────
 
     def add_optimizer_update(self, n_active: int, total_d: int) -> int:
@@ -696,12 +823,84 @@ class CycleAccumulator:
         self._cyc["optimizer"] += cyc
         return cyc
 
+    def add_render_inference(
+        self,
+        n_active: int,
+        n_visible: int,
+        tile_touches: int,
+        H: int,
+        W: int,
+        sh_degree: int,
+    ) -> int:
+        """ASIC per-frame INFERENCE render cycles (EWA splatting, forward only).
+
+        Shares phases 1-3 with :meth:`add_render_training_iter` (preprocess +
+        radix sort + alpha compositing forward) and explicitly excludes phases
+        4-6 (photometric loss, alpha-compositing backward, preprocessing
+        backward), which are training-only.
+
+        This method **overwrites** ``_cyc["render"]`` with the single-frame
+        count so that ``asic_render_cycles`` always reports the most recent
+        inference frame, consistent with the legacy
+        :meth:`set_render_cycles_from_fps` semantics.
+
+        Parameters mirror those of :meth:`add_render_training_iter`; all are
+        measurable from one render call on the masked inference proxy
+        (no magic numbers, no estimation):
+
+          n_active     : Gaussians actually submitted to the rasterizer
+                         (= MaskedGaussianProxy.n_gaussians() under mode >=2)
+          n_visible    : (render_pkg["radii"] > 0).sum()
+          tile_touches : n_visible × π × (avg_r/16)²  (BLOCK_X=16 is the
+                         diff-gaussian-rasterization tile size)
+          H, W         : render_pkg["render"].shape[-2:]
+          sh_degree    : gaussians.active_sh_degree
+
+        Returns the single-frame cycle count, so callers can derive
+        ``asic_fps = clock_hz / cyc``.
+        """
+        if n_active == 0:
+            self._cyc["render"] = 0
+            return 0
+        s = self.spec
+
+        sh_params = 3 * (sh_degree + 1) ** 2
+        sh_macs   = sh_params
+        cov_macs  = 15
+        proj_macs = 4
+        per_g_macs = sh_macs + cov_macs + proj_macs
+
+        # ── Phase 1: preprocessing forward (over N_active) ──────────────────
+        p1_compute = _ceil(n_active * per_g_macs,              s.mac_units)
+        p1_read    = _ceil(n_active * (11 + sh_params) * 4,    s.dram_bw_bytes)
+        p1_write   = _ceil(max(n_visible, 0) * 10 * 4,          s.dram_bw_bytes)
+        phase1 = max(p1_compute, p1_read) + p1_write
+
+        # ── Phase 2: radix sort (32-bit key-value, tile_touches entries) ────
+        p2_compute = _ceil(tile_touches * 32,      s.cmp_units)
+        p2_bw      = _ceil(tile_touches * 8 * 2,   s.dram_bw_bytes)
+        phase2 = max(p2_compute, p2_bw)
+
+        # ── Phase 3: alpha compositing forward ──────────────────────────────
+        p3_compute = _ceil(tile_touches * 19,      s.mac_units)
+        p3_read    = _ceil(tile_touches * 9 * 4,   s.dram_bw_bytes)
+        p3_write   = _ceil(H * W * 3 * 4,          s.dram_bw_bytes)
+        phase3 = max(p3_compute, p3_read) + p3_write
+
+        cyc = phase1 + phase2 + phase3
+        self._cyc["render"] = cyc
+        return cyc
+
     def set_render_cycles_from_fps(self, fps: float) -> None:
-        """Back-calculate render cycles from measured FPS (no estimation).
+        """(Legacy) back-calculate render cycles from a measured GPU FPS.
+
+        Kept for backwards compatibility with older ablation runners and for
+        any path where no render_pkg stats are available.  Prefer
+        :meth:`add_render_inference`, which models ASIC render cost directly
+        from measurable per-frame geometry (n_visible, tile_touches, H×W,
+        sh_degree).
 
         render_cycles = clock_hz / fps
-
-        Called once after MetricsCollector.measure_fps() completes.
         Overwrites any previously stored render cycle count.
         """
         if fps > 0:
@@ -732,16 +931,27 @@ class CycleAccumulator:
           asic_ntc_cycles    : NTC forward-inference cycles (PUOE tensor core).
             Add to commit cycles for absolute comparison with GPU training time.
 
+        Notes
+        -----
+        Callers that want a wall-clock figure should either
+        (a) use ``asic_commit_time_s`` (commit path only) or
+        (b) assemble ``asic_train_time_s`` per-baseline by summing the
+            relevant cycle buckets through ``result_schema.build_result``.
+        The old ``asic_time_s_1ghz = asic_total_cycles / clock_hz`` field
+        was removed because it silently excluded ``ntc_train*`` /
+        ``ntc`` cycles — dominant for 3DGStream / 4DGC — and was easily
+        mistaken for the headline training time.
+
         Returns
         -------
         dict with keys:
+          asic_ntc_train_render_cycles, asic_ntc_train_cycles,
           asic_ntc_cycles,
           asic_puoe_cycles, asic_ucn_cycles, asic_ice_cycles,
           asic_ilsf_cycles (update + render combined),
           asic_salience_cycles, asic_optimizer_cycles, asic_render_cycles,
           asic_gradient_pipeline_cycles, asic_post_render_cycles,
-          asic_total_cycles, asic_time_s_1ghz,
-          asic_commit_time_s
+          asic_total_cycles, asic_commit_time_s
         """
         gradient_pipeline = max(
             self._cyc["puoe"],
@@ -770,7 +980,6 @@ class CycleAccumulator:
             "asic_gradient_pipeline_cycles":  gradient_pipeline,
             "asic_post_render_cycles":        post_render,
             "asic_total_cycles":              total,
-            "asic_time_s_1ghz":               total / self.spec.clock_hz,
             "asic_commit_time_s":             commit_cycles / self.spec.clock_hz,
         }
 

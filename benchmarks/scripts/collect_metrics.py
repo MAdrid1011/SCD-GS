@@ -3,7 +3,7 @@ Aggregate benchmark results from all four baselines into a single table.
 
 Every number printed here comes from either:
   (a) a per-baseline run output JSON
-      (bench_queen.py / eval_3dgstream.py / Swift4D metrics.py / HiCoM log), or
+      (bench_queen.py / eval_3dgstream.py / 4DGC train_frames.py / HiCoM log), or
   (b) the minimal QUEEN prior-run subset committed under
       data/assets/QUEEN/flame_steak_prior/  (see benchmarks/README.md).
 
@@ -130,49 +130,32 @@ def load_3dgstream():
     }
 
 
-# ── Swift4D ──────────────────────────────────────────────────────────────────
-def load_swift4d():
-    # Check per-frame results from Swift4D's metrics.py output
-    metrics_path = RESULTS / "Swift4D/flame_steak/metrics.json"
-    if metrics_path.exists():
-        return safe_load(metrics_path)
+# ── 4DGC ─────────────────────────────────────────────────────────────────────
+def load_4dgc():
+    """Source 4DGC metrics from the ablation-runner output.
 
-    # Parse training log for timing
-    log = RESULTS / "Swift4D/flame_steak/training_log.txt"
-    d = {"method": "Swift4D", "dataset": "flame_steak"}
-    if log.exists():
-        with open(log) as f:
-            content = f.read()
-        # Swift4D trains 13000 iterations total (all frames bundled)
-        # Get total training time from log
-        times = re.findall(r"Training complete.*?(\d+\.\d+)\s+seconds", content, re.S)
-        # Extract PSNR from psnr.txt if exists
-    psnr_txt = REPO_ROOT / "baselines" / "Swift4D" / "psnr.txt"
-    if psnr_txt.exists():
-        with open(psnr_txt) as f:
-            lines = f.readlines()
-        vals = [float(x.split()[-1]) for x in lines if x.strip() and x.strip().replace('.','').replace('-','').isdigit() == False]
-        # Parse psnr values
-        psnr_vals = []
-        for line in lines:
-            parts = line.strip().split()
-            if parts:
-                try:
-                    psnr_vals.append(float(parts[-1]))
-                except:
-                    pass
-        if psnr_vals:
-            d["avg_psnr"] = float(np.mean(psnr_vals[-20:]))
-
-    # FPS from render log
-    render_log = RESULTS / "Swift4D/flame_steak/render_log.txt"
-    if render_log.exists():
-        with open(render_log) as f:
-            txt = f.read()
-        m = re.search(r"FPS:\s*([0-9.]+)", txt)
-        if m:
-            d["avg_fps"] = float(m.group(1))
-
+    4DGC does not have a standalone bench_* harness; its head-to-head numbers
+    come from simulator/ablation/run_4dgc.py (mode 0 is the untouched GPU
+    baseline).  The runner emits a JSON at
+    ``results/GLASS_ablation/flame_steak/4DGC/mode_0.json`` whose schema is a
+    superset of what this collector needs.
+    """
+    d = {"method": "4DGC", "dataset": "flame_steak"}
+    mode0_path = (
+        RESULTS / "GLASS_ablation" / "flame_steak" / "4DGC" / "mode_0.json"
+    )
+    if mode0_path.exists():
+        r = safe_load(mode0_path)
+        d.update({
+            "avg_train_time_s_per_frame": r.get("avg_train_time_s"),
+            "avg_psnr":                   r.get("psnr"),
+            "avg_ssim":                   r.get("ssim"),
+            "avg_lpips":                  r.get("lpips"),
+            "avg_fps":                    r.get("render_fps"),
+            "total_storage_mb":           r.get("total_storage_mb"),
+            "avg_storage_per_frame_mb":   r.get("delta_storage_mb"),
+            "source":                     str(mode0_path.relative_to(REPO_ROOT)),
+        })
     return d
 
 
@@ -202,8 +185,8 @@ def main():
     methods = {
         "QUEEN":     queen,
         "3DGStream": load_3dgstream(),
-        "Swift4D":   load_swift4d(),
         "HiCoM":     load_hicom(),
+        "4DGC":      load_4dgc(),
     }
 
     # GPU string is best-effort; leaves "unknown" if torch is not importable.

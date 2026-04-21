@@ -1,6 +1,6 @@
 # GPU Baseline Benchmarks
 
-This directory houses the **GPU-side** head-to-head harness for the four shipped baselines (QUEEN, 3DGStream, HiCoM, Swift4D). It sits alongside [`simulator/ablation/`](../simulator/ablation/) — the two together produce the two columns of numbers compared in the paper:
+This directory houses the **GPU-side** head-to-head harness for the four shipped baselines (QUEEN, 3DGStream, HiCoM, 4DGC). It sits alongside [`simulator/ablation/`](../simulator/ablation/) — the two together produce the two columns of numbers compared in the paper:
 
 - `benchmarks/` → GPU wall-clock + quality + FPS + storage (what the baseline actually does)
 - `simulator/ablation/` → ASIC-projected cycle counts + the same quality/FPS/storage passed through the GLASS pipeline
@@ -11,7 +11,7 @@ This directory houses the **GPU-side** head-to-head harness for the four shipped
 
 ```text
 benchmarks/
-├── run_all_serial.sh            master runner — 7 steps, one baseline at a time
+├── run_all_serial.sh            master runner — 5 steps, one baseline at a time
 ├── configs/
 │   ├── bench_config.yaml        single source of truth for per-baseline paths
 │   ├── 3dgstream_flame_steak.json       smoke (5-frame) training config
@@ -134,8 +134,8 @@ results/
 ├── QUEEN/
 │   ├── bench_log.txt
 │   └── flame_steak_metrics.json ← read by collect_metrics.py (QUEEN row)
-├── Swift4D/flame_steak/{training,render,metrics}_log.txt
 ├── HiCoM/flame_steak/{training_log.txt, output/}
+├── GLASS_ablation/flame_steak/4DGC/mode_0.json  ← read by collect_metrics.py (4DGC row)
 └── metric_table.json          ← unified PSNR / SSIM / LPIPS / FPS / storage table
 ```
 
@@ -145,8 +145,8 @@ results/
 Method       PSNR    SSIM   LPIPS      FPS  Train(s/f)  Store(MB)
 QUEEN       31.42  0.9435  0.1470   240.3        4.11      141.0
 3DGStream   30.14  0.9128  0.1902    54.7        8.23      ...
-Swift4D      ...     ...     ...     ...          ...       ...
 HiCoM        ...     ...     ...     ...          ...       ...
+4DGC         ...     ...     ...     ...          ...       ...
 ```
 
 Every number in the QUEEN row is read from `data/assets/QUEEN/flame_steak_prior/results.json`, `avg_metrics.json`, and `training_metrics.json` — **no constants are hard-coded** in `collect_metrics.py`. Substitute your own prior-run subset to bench a different scene.

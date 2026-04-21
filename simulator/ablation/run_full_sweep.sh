@@ -40,4 +40,12 @@ done
 # 3DGStream — only mode 0 needs the 10-frame extension (1-3 already done).
 run_one 3dgstream-cu121  3DGStream 0 || echo "  3DGStream m=0 FAILED"
 
+# 4DGC — 4 modes × 10 frames (requires prior train_initial.py + Motion_Grid
+# warmup on data/<scene>/4dgc_init/; see simulator/datasets.py for paths).
+# Assumes a conda env named ``4dgc-cu121`` with 3DGStream's rasterizer/simple-knn
+# plus compressai + range-coder installed on top.
+for m in 0 1 2 3; do
+    run_one 4dgc-cu121       4DGC      "$m" || echo "  4DGC m=$m FAILED"
+done
+
 echo "[$(date '+%H:%M:%S')] ====== FULL SWEEP DONE ======"

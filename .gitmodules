@@ -4,9 +4,9 @@
 [submodule "baselines/3DGStream"]
 	path = baselines/3DGStream
 	url = https://github.com/SJoJoK/3DGStream.git
-[submodule "baselines/Swift4D"]
-	path = baselines/Swift4D
-	url = https://github.com/WuJH2001/swift4d.git
 [submodule "baselines/HiCoM"]
 	path = baselines/HiCoM
 	url = https://github.com/gqk/HiCoM.git
+[submodule "baselines/4DGC"]
+	path = baselines/4DGC
+	url = https://github.com/qianghu-huber/4DGC.git

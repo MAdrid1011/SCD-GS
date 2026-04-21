@@ -166,7 +166,52 @@ One iteration = forward + backward + Adam over `(n_hash_params + n_mlp_macs_per_
 
 ### `add_render_training_iter(n, n_visible, tile_touches, H, W, sh_degree, n_iters)` — forward render + photometric loss backward
 
-Charged per NTC training iteration. Reads scene stats captured by `pipeline.post_render()`; the lag-one usage (previous frame's stats feed the current frame's schedule) mirrors `_prev_suppression_ratio`.
+Charged per NTC / MEM / gaussian training iteration. Six sequential EWA-splatting phases — (1) preprocessing forward, (2) 32-bit radix sort over `tile_touches`, (3) alpha compositing forward, (4) photometric L1+SSIM loss, (5) alpha compositing backward, (6) preprocessing backward. Reads scene stats captured by `pipeline.post_render()`; the lag-one usage (previous frame's stats feed the current frame's schedule) mirrors `_prev_suppression_ratio`.
+
+Under Mode ≥ 2 the `n / n_visible / tile_touches` arguments are **active-ratio-scaled** by `pipeline._train_render_active_counts()` (GLASS §6 "Dual-Consumer Access" — update- and render-side consumers share the same on-fabric residency). This makes `asic_ntc_train_render_cycles` respond monotonically to ILSF (Mode 2) and Salience (Mode 3), not just inference FPS.
+
+### `add_render_inference(n_active, n_visible, tile_touches, H, W, sh_degree)` — per-frame inference render (headline FPS)
+
+Mirrors phases 1-3 of `add_render_training_iter` (preprocess + sort + alpha-compositing forward) and explicitly excludes phases 4-6 (loss, compositing backward, preprocessing backward — training-only). Per-frame cost; overwrites `_cyc["render"]` like the legacy `set_render_cycles_from_fps`.
+
+```
+sh_params = 3 × (sh_degree+1)²               # exact SH coefficient count
+per_g_macs = sh_params + 15 + 4              # SH dot + EWA cov (RSS^TR^T + 2D proj) + 3D→2D proj
+
+# Phase 1 — preprocessing (over N_active, hit-visible only writes)
+p1_compute = ⌈N_active × per_g_macs              / mac⌉
+p1_read    = ⌈N_active × (11 + sh_params) × 4    / bw_dram⌉
+p1_write   = ⌈N_visible × 10 × 4                 / bw_dram⌉
+phase1     = max(p1_compute, p1_read) + p1_write
+
+# Phase 2 — 32-bit radix sort (tile||depth KV, 32 passes, read+write amortised)
+p2_compute = ⌈tile_touches × 32 / cmp⌉
+p2_bw      = ⌈tile_touches × 8 × 2 / bw_dram⌉
+phase2     = max(p2_compute, p2_bw)
+
+# Phase 3 — alpha compositing forward (19 MACs per Gaussian-tile intersection)
+p3_compute = ⌈tile_touches × 19 / mac⌉
+p3_read    = ⌈tile_touches × 9 × 4 / bw_dram⌉     # cov2D+mean2D+color+opacity
+p3_write   = ⌈H × W × 3 × 4 / bw_dram⌉            # rendered image
+phase3     = max(p3_compute, p3_read) + p3_write
+
+cycles     = phase1 + phase2 + phase3
+asic_fps   = clock_hz / cycles
+```
+
+All five arguments are measured from a single forward pass through the `MaskedGaussianProxy` that `make_render_proxy()` builds for the current ablation mode:
+
+- `N_active` = `proxy.get_xyz.shape[0]` (hot ratio × N under Mode ≥ 2)
+- `N_visible` = `(render_pkg["radii"] > 0).sum()`
+- `tile_touches` = `N_visible × π × (avg_r/16)²`  (tile_size=16 from `diff_gaussian_rasterization/config.h`)
+- `H`, `W` from `render_pkg["render"].shape[-2:]`
+- `sh_degree` from `gaussians.active_sh_degree`
+
+**Why this replaces `set_render_cycles_from_fps` as the FPS headline.** The four baselines' GPU-side `render_fn` differ in SH degree, Gaussian scale distribution, kernel-launch overhead and AMP / TF32 flags. Back-calculating `render_cycles = clock_hz / gpu_fps` folded all those simulator-host artefacts into the ASIC number, making Mode-0 FPS heterogeneous across baselines (e.g. 4DGC 42 FPS vs 3DGStream 143 FPS on the same 280 k-Gaussian scene) for reasons unrelated to the GLASS architecture. Modelling from EWA-splatting first principles yields ASIC FPS that depends only on the masked-proxy geometry the ASIC would see, and is directly comparable across baselines.
+
+### `set_render_cycles_from_fps(fps)` — legacy GPU FPS fallback
+
+Back-calculates `render_cycles = clock_hz / fps` from a measured GPU wall-clock FPS. Retained for backwards compatibility with ablation runs that predate `add_render_inference`, and for any path without render-stat access. Not used on the main FPS measurement path any more — every runner now calls `pipeline.measure_asic_render_fps(...)`, which captures stats and invokes `add_render_inference` internally, co-measuring `render_fps_gpu_measured` as a diagnostic.
 
 ### `add_mlp_training(n_params, n_iters)` — generic backward + Adam MLP loop
 
@@ -183,25 +228,27 @@ asic_overhead      = gradient_pipeline + post_render
 total              = asic_overhead + optimizer + render
 commit_cycles      = gradient_pipeline + optimizer
 
-asic_time_s_1ghz   = total         / clock_hz              # headline total
 asic_commit_time_s = commit_cycles / clock_hz              # commit-path only
+# asic_train_time_s is assembled per-baseline by result_schema.build_result
+# (see below); the old asic_time_s_1ghz = total/clock_hz field was dropped
+# because it silently excluded ntc_train cycles and was easy to misread.
 ```
 
 **Why `max()` rather than `sum()` for the pipeline:** PUOE, UCN, and ICE form a 3-stage streaming pipeline reading the same descriptor stream on different banks. `ilsf_update` reads the same stream on yet another bus — also absorbed.
 
 **`ilsf_sort` missing:** hidden by the concurrent ICE pass. The cycles are recorded but never included in a sum.
 
-**`render` meaning:** set once per frame via `set_render_cycles_from_fps(fps)` from the GPU-measured FPS — it models raster work that the ASIC doesn't change.
+**`render` meaning:** set once per frame via `add_render_inference(...)` from first-principles EWA-splatting phases 1-3, using the masked proxy's geometry under the current ablation mode. The headline `render_fps = clock_hz / render_cycles` is therefore a pure ASIC model number. `render_fps_gpu_measured` is also stored (wall-clock on the same proxy) for auditing; it's never used for cycle accounting.
 
-**`asic_commit_time_s` vs `asic_train_time_s`:** use `commit` for progressive Mode 0 → 1 → 2 comparisons because NTC cycles are identical across modes and would mask differences. Use `train` for absolute comparisons against GPU wall-clock.
+**`asic_commit_time_s` vs `asic_train_time_s`:** use `commit` for progressive Mode 0 → 1 → 2 comparisons because NTC cycles are identical across modes and would mask differences. Use `train` as the headline absolute ASIC training time for cross-baseline comparisons.
 
 ---
 
 ## Emitted JSON keys from `summary()`
 
 ```
-asic_ntc_train_render_cycles     # per-iter forward-render + photometric loss × n_iters (3DGStream)
-asic_ntc_train_cycles            # NTC training loop (fwd+bwd+Adam) × n_iters
+asic_ntc_train_render_cycles     # per-iter forward-render + photometric loss × n_iters (3DGStream / 4DGC / HiCoM / QUEEN)
+asic_ntc_train_cycles            # NTC / MEM / MLP training loop (fwd+bwd+Adam) × n_iters
 asic_ntc_cycles                  # NTC forward inference (per frame)
 asic_puoe_cycles
 asic_ucn_cycles
@@ -209,15 +256,24 @@ asic_ice_cycles
 asic_ilsf_cycles                 # ilsf_update + ilsf_render (combined)
 asic_salience_cycles
 asic_optimizer_cycles
-asic_render_cycles               # set_render_cycles_from_fps
+asic_render_cycles               # add_render_inference (phases 1-3, modelled)
 asic_gradient_pipeline_cycles    # max(puoe, ucn, ice, ilsf_update)
 asic_post_render_cycles          # max(ilsf_render, salience)
 asic_total_cycles                # overhead + optimizer + render
-asic_time_s_1ghz                 # total / clock_hz
 asic_commit_time_s               # (pipeline + optimizer) / clock_hz
 ```
 
-The runner additionally writes `asic_train_time_s = asic_commit_time_s + asic_ntc_train_cycles/clock_hz + asic_ntc_train_render_cycles/clock_hz` — the total ASIC-projected incremental training time, used head-to-head with `avg_train_time_s` (GPU wall).
+Each ablation runner assembles `asic_train_time_s` from a
+baseline-specific subset of these buckets and passes the result through
+`simulator.ablation.result_schema.build_result`, which writes the
+canonical JSON schema.  Current per-baseline formulas:
+
+| Baseline   | `asic_train_time_s` × `clock_hz` |
+|------------|----------------------------------|
+| 3DGStream  | `ntc_train_render + ntc_train + ntc + gradient_pipeline + optimizer` |
+| 4DGC       | `ntc_train_render + ntc_train + ntc + gradient_pipeline + optimizer` |
+| QUEEN      | `ntc_train_render + gradient_pipeline + optimizer` (no NTC inference path) |
+| HiCoM      | `ntc_train_render + gradient_pipeline + optimizer` |
 
 ---
 
