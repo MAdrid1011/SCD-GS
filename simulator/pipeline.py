@@ -18,17 +18,26 @@ Stage mapping
   Stage 1  ConsolidationUnit            — gradient fold / scale
   Stage 2  IncrementalCommitEngine      — apply scales + cold-grad zero (in pipeline)
   Stage 3  LiveStateFabric              — hotness tracking + render mask
-  Stage 4  SalienceFirstIssue           — PROMOTE / FULL / SKIP classifier
+  Stage 4  ConvergenceGrader            — Grade-A / Grade-B / Grade-D classifier
+                                          (Convergence-Graded Splatting, CGS;
+                                           replaces the legacy Salience-First
+                                           Render Issue — the legacy
+                                           ``SalienceFirstIssue`` class is now
+                                           a thin shim in salience_issue.py.)
   Stage 5  Render Backend               — baseline render() called with proxy
 
 Ablation mode gates
 -------------------
   mode >= 1  → Stage 1 active (consolidation scales applied)
-  mode >= 2  → Stage 3 active (cold-mask zeroing + fabric render mask)
-  mode >= 3  → Stage 4 active (salience filter added to render mask)
+  mode >= 2  → Stage 3 active (cold-mask zeroing + fabric render mask on
+              training-side render cycles only — inference renders the
+              full Gaussian set)
+  mode >= 3  → Stage 4 active (CGS grade filter applied to inference
+              rendering: Grade-D pruned, Grade-B dispatched to the
+              SH1 + fp16 Compact hardware path)
 
 At mode=0 (Base ASIC) the pipeline only captures descriptors and calls
-post_render() (hotness/salience bookkeeping), adding a small Python overhead
+post_render() (hotness / CGS support bookkeeping), adding a small Python overhead
 but applying no gradient modifications and no render masking.
 """
 from __future__ import annotations
@@ -41,10 +50,10 @@ import torch
 
 from simulator.config import ASICConfig
 from simulator.core.consolidation import ConsolidationUnit
+from simulator.core.support_domain_grade import ConvergenceGrader
 from simulator.core.cycle_model import CycleAccumulator
 from simulator.core.live_state_fabric import LiveStateFabric
 from simulator.core.proxy import MaskedGaussianProxy
-from simulator.core.salience_issue import SalienceFirstIssue
 from simulator.core.update_descriptor import AttrClass, UpdateDescriptor, UpdateStream
 
 if TYPE_CHECKING:
@@ -77,10 +86,21 @@ class GLASSPipeline:
         self.cfg  = config
         self.slot = slot
 
-        # Core compute units — instantiated once, reused every frame
+        # Core compute units — instantiated once, reused every frame.
+        # ``self.salience`` is an alias for ``self.grader`` kept for
+        # backwards compatibility with call sites that still reference
+        # the legacy Stage-4 name.
         self.consolidation = ConsolidationUnit(config)
         self.fabric        = LiveStateFabric(config)
-        self.salience      = SalienceFirstIssue(config)
+        self.grader        = ConvergenceGrader(config)
+        self.salience      = self.grader  # deprecated alias
+
+        # Cached grade masks from the most recent ``make_render_proxy`` /
+        # ``measure_asic_render_fps`` call.  Used by the graded-render
+        # cycle model and by ``stream_stats`` so the reported n_grade_*
+        # counts reflect the same classification as the rendered proxy.
+        self._grade_masks: "tuple[torch.BoolTensor, torch.BoolTensor, torch.BoolTensor] | None" = None
+        self._cgs_frame_update_max: torch.Tensor | None = None
 
         # Cycle-accurate ASIC timing model
         self._cycles       = CycleAccumulator(config.asic_spec)
@@ -165,6 +185,81 @@ class GLASSPipeline:
             return self._feedback_suppressed_bytes / self._feedback_total_bytes
         return self._prev_suppression_ratio
 
+    def scheduled_train_iters(
+        self,
+        base_iters: int,
+        suppression_ratio: float | None = None,
+    ) -> int:
+        """Convert UCN feedback into a bounded training-iteration budget."""
+        base = max(0, int(base_iters))
+        if base == 0:
+            return 0
+        ratio = (
+            self.current_frame_suppression_ratio()
+            if suppression_ratio is None
+            else float(suppression_ratio)
+        )
+        if ratio != ratio:  # NaN guard
+            ratio = 0.0
+        cap = float(self.cfg.adaptive_iter_suppression_cap)
+        ratio = max(0.0, min(cap, min(1.0, ratio)))
+        return max(int(self.cfg.min_ntc_iters_floor), round(base * (1.0 - ratio)))
+
+    def _accumulate_cgs_gpu_updates(
+        self,
+        norms: torch.Tensor,
+        grad_scale: torch.Tensor | None = None,
+    ) -> None:
+        """Accumulate effective per-Gaussian update strength for CGS.
+
+        This stays on device during dense optimizer/NTC iterations and is
+        copied to the CPU-backed grader once per frame.  ``grad_scale`` is
+        the UCN/ICE gate, so suppressed updates become zero convergence
+        samples instead of raw pre-gate deltas.
+        """
+        if self.cfg.mode < 3 or norms.numel() == 0:
+            return
+        eff = norms.detach().reshape(-1)
+        if eff.dtype != torch.float32:
+            eff = eff.to(torch.float32)
+        if grad_scale is not None:
+            scale = grad_scale.detach().reshape(-1).to(
+                device=eff.device, dtype=eff.dtype,
+            )
+            if scale.shape[0] < eff.shape[0]:
+                pad = torch.ones(
+                    eff.shape[0] - scale.shape[0],
+                    dtype=eff.dtype,
+                    device=eff.device,
+                )
+                scale = torch.cat([scale, pad])
+            eff = eff * scale[: eff.shape[0]].clamp_min(0.0)
+
+        if self._cgs_frame_update_max is None:
+            self._cgs_frame_update_max = eff.clone()
+            return
+        if self._cgs_frame_update_max.device != eff.device:
+            self._cgs_frame_update_max = self._cgs_frame_update_max.to(eff.device)
+        if self._cgs_frame_update_max.shape[0] < eff.shape[0]:
+            pad = torch.zeros(
+                eff.shape[0] - self._cgs_frame_update_max.shape[0],
+                dtype=self._cgs_frame_update_max.dtype,
+                device=self._cgs_frame_update_max.device,
+            )
+            self._cgs_frame_update_max = torch.cat([
+                self._cgs_frame_update_max, pad,
+            ])
+        self._cgs_frame_update_max[: eff.shape[0]] = torch.maximum(
+            self._cgs_frame_update_max[: eff.shape[0]], eff,
+        )
+
+    def _flush_cgs_gpu_frame_updates(self) -> None:
+        """Move the current frame's CGS update sample into the grader once."""
+        if self._cgs_frame_update_max is None:
+            return
+        self.grader.record_updates_bulk(self._cgs_frame_update_max)
+        self._cgs_frame_update_max = None
+
     def begin_frame(self) -> None:
         """Advance the frame counter and reset per-frame state.
 
@@ -202,6 +297,12 @@ class GLASSPipeline:
         self._prev_frame_step_count   = prev_step_count
         self._steps_this_frame        = 0
         self._first_opt_param_id      = None
+        if self.cfg.mode >= 3:
+            self._flush_cgs_gpu_frame_updates()
+            # CGS uses a frame/sample window.  All optimizer-step delta
+            # samples collected during the previous frame are committed as
+            # one S_i^(W) entry here.
+            self.grader.flush_frame_updates()
 
         # ── Auto-structural UCN decision ──────────────────────────────────────
         # Done exactly once, at the start of frame 2, using the cadence
@@ -553,10 +654,10 @@ class GLASSPipeline:
         # (same lag-one design as _prev_suppression_ratio).  Frame 0: skipped (None).
         #
         # Mode ≥ 2: scale n, n_visible, and tile_touches by the fabric /
-        # salience residency ratio so that the training-render cycles
+        # CGS residency ratio so that the training-render cycles
         # see the same subset as the inference-render proxy — see
         # :meth:`_train_render_active_counts`.  This is the mechanism by
-        # which ILSF (Mode 2) and Salience (Mode 3) reduce
+        # which ILSF (Mode 2) and CGS (Mode 3) reduce
         # ``asic_ntc_train_render_cycles`` on baselines whose
         # runner-installed render hook always feeds the full
         # ``_prev_render_stats`` (3DGStream, QUEEN, HiCoM).  Modes 0/1
@@ -586,34 +687,40 @@ class GLASSPipeline:
                 hash_bytes_per_param=hash_bytes_per_param,
             )
 
-        # Stage 0: build N descriptors from measured delta norms.
-        # Record stream length before so we can slice only the new descriptors.
-        _len_before = len(self._stream.descriptors)
-        for i, dn in enumerate(norms.tolist()):
-            self._stream.add(UpdateDescriptor(
-                target_id=i,
-                attr_class=AttrClass.XYZ,   # representative; bytes via total_d
-                delta_norm=float(dn),
-                version=self._version,
-                struct_changed=False,
-            ))
+        # Stage 0: dense NTC streams are vectorized.  Older revisions created
+        # one Python UpdateDescriptor per Gaussian here; on 200K+ Gaussian
+        # models that made the simulator host-bound before the ASIC model was
+        # even exercised.  The NTC path carries one representative
+        # per-Gaussian update magnitude, so the descriptor semantics reduce to
+        # a single batched XYZ-class stream.
+        norms_vec = norms.detach().reshape(-1)
+        if norms_vec.dtype != torch.float32:
+            norms_vec = norms_vec.to(torch.float32)
         self._cycles.add_puoe(N, total_d)
 
         # Stage 1 — consolidation (mode >= 1).
-        # compute_scales() sets d.grad_scale in-place on each descriptor,
-        # which is what makes frame_suppressed_bytes / frame_suppression_ratio
-        # reflect the consolidation's suppression effect.
+        # compute_scales_batched() is the tensor equivalent of the old
+        # descriptor pass.  It updates the same CWB logic and returns one
+        # grad_scale per Gaussian without materializing host objects.
+        grad_scale = None
+        n_suppressed = 0
         if self.cfg.mode >= 1:
-            gaussian_scales = self.consolidation.compute_scales(self._stream)
-            self._n_gs_active = sum(
-                1 for v in gaussian_scales.values() if v > 0.0
+            per_attr_scale, gid_min = self.consolidation.compute_scales_batched(
+                {AttrClass.XYZ.value: norms_vec}
             )
+            grad_scale = per_attr_scale[AttrClass.XYZ.value]
+            if gid_min is None:
+                self._n_gs_active = 0
+            else:
+                stats = torch.stack([
+                    (gid_min > 0.0).to(torch.int64).sum(),
+                    (grad_scale <= 0.0).to(torch.int64).sum(),
+                ]).cpu().tolist()
+                self._n_gs_active = int(stats[0])
+                n_suppressed = int(stats[1])
             self._cycles.add_ucn(N)
             # Update suppression ratio for NEXT frame's NTC iteration scheduling.
-            # Counts NTC descriptors added in this call only (sliced by _len_before).
-            new_descs = self._stream.descriptors[_len_before:]
-            n_suppressed = sum(1 for d in new_descs if d.grad_scale == 0.0)
-            self._prev_suppression_ratio = n_suppressed / max(len(new_descs), 1)
+            self._prev_suppression_ratio = n_suppressed / max(N, 1)
 
         # ICE: scale-only (mode 1) XOR merged scale+cold-mask (mode >= 2).
         # Mutually exclusive to avoid double-counting _cyc["ice"].
@@ -624,21 +731,22 @@ class GLASSPipeline:
             n_cold = int(cold.sum().item())
             self._cycles.add_ice_merged(N - n_cold, n_cold, total_d)
 
-        # ILSF update: record hotness only for new NTC descriptors.
-        # UCN-suppressed descriptors (grad_scale == 0) go through
-        # record_ucn_suppression so the fabric tracks stability streaks
-        # and eventually lets hotness decay via EMA — this is how UCN's
-        # per-frame stability signal turns into Mode ≥ 2 render-mask
-        # savings (ucn_drive_fabric_demotion in ASICConfig).
-        n_updated = 0
-        for d in self._stream.descriptors[_len_before:]:
-            if d.target_id < 0 or d.delta_norm <= 0.0:
-                continue
-            if d.grad_scale <= 0.0:
-                self.fabric.record_ucn_suppression(d.target_id)
-            else:
-                self.fabric.record_update(d.target_id, d.delta_norm)
-                n_updated += 1
+        # ILSF + CGS feed: both consumers use batched tensor paths.  CGS sees
+        # the post-UCN effective update strength, so suppressed rows become
+        # explicit zero-update convergence samples rather than raw pre-gate
+        # deltas.
+        if self.cfg.mode >= 3:
+            self._accumulate_cgs_gpu_updates(norms_vec, grad_scale)
+        self.fabric.record_updates_bulk(norms_vec, grad_scale)
+        if grad_scale is None:
+            n_updated = int((norms_vec > 0.0).to(torch.int64).sum().item())
+        else:
+            n_updated = int(
+                ((norms_vec > 0.0) & (grad_scale > 0.0))
+                .to(torch.int64)
+                .sum()
+                .item()
+            )
         self._cycles.add_ilsf_update(n_updated)
 
         # Optimizer cycles — n_opt varies by mode (models ASIC write savings):
@@ -654,14 +762,15 @@ class GLASSPipeline:
         if n_opt > 0:
             self._cycles.add_optimizer_update(n_opt, total_d)
 
-        # Run-level traffic stats: accumulate only the NTC descriptors added
-        # in this call (snapshot approach avoids double-counting with
-        # pre_optimizer_step which runs separately for added Gaussians).
-        _ntc_descs      = self._stream.descriptors[_len_before:]
-        _ntc_total_b    = sum(d.delta_bytes() for d in _ntc_descs)
-        _ntc_supp_b     = sum(
-            d.delta_bytes() for d in _ntc_descs if d.grad_scale < 1.0
-        )
+        # Run-level traffic stats: one representative XYZ-class descriptor per
+        # Gaussian, matching the old NTC stream accounting but without storing
+        # descriptor objects.
+        _bytes_per_desc = AttrClass.XYZ.delta_bytes()
+        _ntc_total_b    = N * _bytes_per_desc
+        _ntc_supp_b     = n_suppressed * _bytes_per_desc
+        self._frame_total_bytes      += _ntc_total_b
+        self._frame_suppressed_bytes += _ntc_supp_b
+        self._frame_unique_targets = max(self._frame_unique_targets, N)
         self._total_bytes_all      += _ntc_total_b
         self._suppressed_bytes_all += _ntc_supp_b
         # Feed NTC byte traffic into the adaptive-threshold feedback
@@ -712,7 +821,7 @@ class GLASSPipeline:
             return
 
         # Fast path for mode 1/2/3 (Consolidation + optional cold-mask +
-        # optional salience) — same motivation as mode 0: the dict/
+        # optional CGS structural marking) — same motivation as mode 0: the dict/
         # descriptor path iterates N_gaussians × num_attrs Python objects
         # per optimizer step (for QUEEN: 188K × 6 ≈ 1.1M/step, ≈ 220M/
         # frame) and becomes the CPU-bound wall-clock bottleneck.  The
@@ -722,7 +831,7 @@ class GLASSPipeline:
         #
         # Mode 2 adds: cold-mask grad zeroing + ICE-merged cycle accounting
         #              + n_opt = render_mask.sum() (instead of UCN active)
-        # Mode 3 adds: salience.mark_structural, but that only consumes
+        # Mode 3 adds: grader.mark_structural, but that only consumes
         #              struct_changed_ids from the stream — the fast path
         #              never pushes per-Gaussian descriptors, matching the
         #              slow path behaviour when struct_changed is None
@@ -770,8 +879,16 @@ class GLASSPipeline:
         # stable Gaussians eventually drop into CSS and stop consuming
         # render cycles in Mode ≥ 2 (ucn_drive_fabric_demotion).
         n_updated = 0
+        cgs_active = self.cfg.mode >= 3
         for d in self._stream.descriptors[_len_before:]:
-            if d.target_id < 0 or d.delta_norm <= 0.0:
+            if d.target_id < 0:
+                continue
+            if cgs_active:
+                self.grader.record_update(
+                    d.target_id,
+                    d.delta_norm * max(float(d.grad_scale), 0.0),
+                )
+            if d.delta_norm <= 0.0:
                 continue
             if d.grad_scale <= 0.0:
                 self.fabric.record_ucn_suppression(d.target_id)
@@ -810,7 +927,7 @@ class GLASSPipeline:
         if _n_opt > 0 and _total_d > 0:
             self._cycles.add_optimizer_update(_n_opt, _total_d)
 
-        # Register structural changes with salience tracker (mode >= 3)
+        # Register structural changes with CGS tracker (mode >= 3)
         if self.cfg.mode >= 3:
             changed = self._stream.struct_changed_ids()
             if changed:
@@ -1115,6 +1232,31 @@ class GLASSPipeline:
 
         self._cycles.add_ilsf_update(n_updated)
 
+        # ── CGS grader feed (mode 3 only) ────────────────────────────────
+        # The fast path never materialises per-Gaussian descriptors.  Keep
+        # the per-step max update on device here; after the unified UCN scale
+        # is known, fold it into the per-frame CGS accumulator without a CPU
+        # sync.  The CPU-backed grader is updated once at frame boundary.
+        cgs_step_norm_gpu: torch.Tensor | None = None
+        if self.cfg.mode >= 3 and main_items:
+            for _p, _ak, n_rows, _d, nrm in main_items:
+                nrm_det = nrm.detach()
+                if nrm_det.dtype != torch.float32:
+                    nrm_det = nrm_det.to(torch.float32)
+                if cgs_step_norm_gpu is None:
+                    cgs_step_norm_gpu = nrm_det.clone()
+                    continue
+                if cgs_step_norm_gpu.shape[0] < n_rows:
+                    pad = torch.zeros(
+                        n_rows - cgs_step_norm_gpu.shape[0],
+                        device=cgs_step_norm_gpu.device,
+                        dtype=cgs_step_norm_gpu.dtype,
+                    )
+                    cgs_step_norm_gpu = torch.cat([cgs_step_norm_gpu, pad])
+                cgs_step_norm_gpu[:n_rows] = torch.maximum(
+                    cgs_step_norm_gpu[:n_rows], nrm_det
+                )
+
         # ── Unified per-gid min scale across main (tensor) and fallback
         # (tensor) contributions.  The dict slow path builds one
         # ``gaussian_scales`` dict over ALL new descriptors in a single
@@ -1144,6 +1286,11 @@ class GLASSPipeline:
                 gid_min_unified[:fb_n_rows] = torch.minimum(
                     gid_min_unified[:fb_n_rows], fb_s
                 )
+
+        if self.cfg.mode >= 3 and cgs_step_norm_gpu is not None:
+            self._accumulate_cgs_gpu_updates(
+                cgs_step_norm_gpu, gid_min_unified,
+            )
 
         # Optimizer cycles.  Slow path passes ``(n_active, total_d)``; the
         # meaning of ``n_active`` depends on the mode:
@@ -1463,58 +1610,112 @@ class GLASSPipeline:
         return (n_updated, fb_new_descs, {},
                 total_bytes, suppressed_bytes, n_gs_ucn, fb_apply_items)
 
+    def _grader_color_bound(
+        self, n: int, device: torch.device | None = None
+    ) -> torch.Tensor:
+        """Return a lightweight per-Gaussian appearance bound for CGS.
+
+        The support-domain formula needs a conservative colour-contribution
+        bound.  For standard Gaussian models this is the norm of the exposed
+        SH feature tensor.  If a baseline exposes a non-standard shape, fall
+        back to ones so CGS still uses opacity and support area.
+        """
+        if n <= 0:
+            return torch.zeros(0, device=device)
+        try:
+            features = self.slot.get_gaussians().get_features
+            if not isinstance(features, torch.Tensor) or features.shape[0] != n:
+                raise ValueError("feature shape does not match radii")
+            feat = features.detach().float().reshape(n, -1)
+            return torch.linalg.vector_norm(feat, dim=1)
+        except Exception:
+            if device is None:
+                try:
+                    device = self.slot.get_gaussians().get_xyz.device
+                except Exception:
+                    device = torch.device("cpu")
+            return torch.ones(n, device=device)
+
+    def _update_grader_support_from_render_pkg(
+        self,
+        render_pkg: dict,
+        *,
+        charge_cycles: bool,
+    ) -> None:
+        """Feed current-view support-domain state into CGS."""
+        if self.cfg.mode < 3 or "radii" not in render_pkg:
+            return
+        radii = render_pkg["radii"].float()
+        if "opacity" in render_pkg:
+            opacity = render_pkg["opacity"].float()
+        else:
+            try:
+                opacity = self.slot.get_gaussians().get_opacity.squeeze(-1)
+            except Exception:
+                opacity = torch.ones(radii.shape[0], device=radii.device)
+        if opacity.shape[0] != radii.shape[0]:
+            opacity = torch.ones(radii.shape[0], device=radii.device)
+
+        color_bound = self._grader_color_bound(radii.shape[0], radii.device)
+        self.grader.update_support_domain(radii, opacity, color_bound)
+
+        if charge_cycles:
+            # Reuse the historical salience bucket for Stage-4 support-domain
+            # bookkeeping so result schemas remain stable.
+            self._cycles.add_salience(radii.shape[0])
+
     # ── Post-render hook ──────────────────────────────────────────────────────
 
     def post_render(self, render_pkg: dict) -> None:
         """Called by the operator slot after every render() call.
 
         Updates LiveStateFabric hotness from visibility and
-        SalienceFirstIssue scores from radii × opacity (mode >= 3).
+        ConvergenceGrader support-domain state from radii × opacity × SH
+        appearance bound (mode >= 3).
 
         Parameters
         ----------
         render_pkg : dict with keys from diff-gaussian-rasterization:
             "visibility_filter" (BoolTensor [N]) — required for fabric
-            "radii"             (IntTensor [N])  — required for salience
+            "radii"             (IntTensor [N])  — required for CGS support
         Additional keys like "opacity" are used if present.
         """
         if "visibility_filter" in render_pkg:
             vf = render_pkg["visibility_filter"]
             if vf is not None and vf.numel() > 0:
                 self.fabric.record_render(vf)
-                # ILSF_render runs in parallel with Salience (different memory).
+                # ILSF_render runs in parallel with CGS support bookkeeping.
                 self._cycles.add_ilsf_render(int(vf.sum().item()))
 
-        if self.cfg.mode >= 3 and "radii" in render_pkg:
-            radii = render_pkg["radii"].float()
-            if "opacity" in render_pkg:
-                opacity = render_pkg["opacity"].float()
-            else:
-                try:
-                    opacity = self.slot.get_gaussians().get_opacity.squeeze(-1)
-                except Exception:
-                    opacity = torch.ones(radii.shape[0], device=radii.device)
-            # HiCoM's merged rasteriser emits ``radii`` over base + incremental
-            # Gaussians, but the slot's accessor may return only the base row
-            # count when incr attributes are not yet registered (transient
-            # state between stage 1 / stage 2 transitions).  Fall back to a
-            # neutral ones-vector whenever the shapes disagree so salience
-            # never sees a ragged (op, r) pair — salience treats it as "no
-            # opacity modulation", equivalent to the explicit fallback path
-            # above for baselines that never expose ``get_opacity``.
-            if opacity.shape[0] != radii.shape[0]:
-                opacity = torch.ones(radii.shape[0], device=radii.device)
-            self.salience.update(radii, opacity)
-            # Salience cycles run in parallel with ILSF_render above.
-            self._cycles.add_salience(radii.shape[0])
+        self._update_grader_support_from_render_pkg(
+            render_pkg, charge_cycles=True,
+        )
 
     # ── Stage 4 + 5: Inference render proxy ──────────────────────────────────
 
     def make_render_proxy(self) -> MaskedGaussianProxy:
         """Build a MaskedGaussianProxy for FPS measurement.
 
-        Applies LiveStateFabric render mask (mode >= 2) and
-        SalienceFirstIssue keep_mask (mode >= 3).
+        Inference-time rendering MUST see the *full* Gaussian set at
+        mode 0/1/2 — the first two optimisations (T1 Update-Stream
+        Consolidation, T2 Incremental Live-State Fabric) accelerate only
+        the incremental-training path.  Their benefits appear inside
+        training-side cycle accounting (gradient pipeline, on-chip state
+        residency for the training-render pass — see
+        :meth:`_train_render_active_counts`), not by pruning primitives
+        the *user* asked to be rendered.  Pruning cold / hot
+        indiscriminately would make an ILSF-cold Gaussian silently
+        invisible even when the current camera view depends on it, which
+        misrepresents what the hardware would actually have to fetch
+        from DRAM.
+
+        Only mode 3 (Convergence-Graded Splatting) is allowed to change
+        the inference render set: Grade-D (conservatively: both
+        training-stable AND visually negligible) is pruned, while
+        Grade-A and Grade-B both enter the proxy.  The per-grade masks
+        are cached on ``self._grade_masks`` so
+        :meth:`measure_asic_render_fps` can split cycles across the
+        Full / Compact hardware paths.
 
         **Never called during training** — full Gaussians are always used
         for loss computation to preserve training quality.
@@ -1525,18 +1726,31 @@ class GLASSPipeline:
         if n == 0:
             raise RuntimeError("No Gaussians in model; cannot make proxy.")
 
-        if self.cfg.mode >= 2:
-            mask = self.fabric.get_render_mask(n)
+        if self.cfg.mode >= 3:
+            self._flush_cgs_gpu_frame_updates()
+            self.grader.flush_frame_updates()
+            A, B, D = self.grader.assign_grades(
+                n,
+                convergence_hint=self.fabric.get_cold_mask(n),
+            )
+            mask = A | B
+            self._grade_masks = (A, B, D)
         else:
             mask = torch.ones(n, dtype=torch.bool)
+            self._grade_masks = None
 
-        if self.cfg.mode >= 3:
-            keep, _ = self.salience.classify(n)
-            mask = mask & keep
-
-        # Safety: ensure at least 1 Gaussian is always rendered
+        # Safety: ensure at least 1 Gaussian is always rendered.  At
+        # mode 3 this also means the Grade-A/Grade-D masks must stay
+        # mutually exclusive for the forced survivor.
         if not mask.any():
             mask[0] = True
+            if self._grade_masks is not None:
+                A, B, D = self._grade_masks
+                A = A.clone()
+                A[0] = True
+                D = D.clone()
+                D[0] = False
+                self._grade_masks = (A, B, D)
 
         indices = mask.nonzero(as_tuple=False).squeeze(1)
         # Move indices to the same device as the Gaussian tensors
@@ -1636,6 +1850,16 @@ class GLASSPipeline:
           tile_touches    : n_visible × π × (avg_r/16)²
           H, W            : render resolution
         """
+        if self.cfg.mode >= 3:
+            # CGS needs current-view support before the render set is
+            # filtered.  This probe models the projection/preprocess stage
+            # that computes support-domain metadata before tile expansion.
+            with torch.no_grad():
+                support_rp = render_fn(cameras[0], self.slot.get_gaussians(), pipe, bg)
+            self._update_grader_support_from_render_pkg(
+                support_rp, charge_cycles=False,
+            )
+
         proxy = self.make_render_proxy()
         n_active = int(proxy.get_xyz.shape[0])
 
@@ -1657,13 +1881,71 @@ class GLASSPipeline:
                          if avg_r > 0 else 0
 
         # ---- Model ASIC render cycles from those stats -----------------
-        render_cycles = self._cycles.add_render_inference(
-            n_active=n_active,
-            n_visible=n_vis,
-            tile_touches=tile_touches,
-            H=H, W=W,
-            sh_degree=sh_degree,
-        )
+        render_full_cycles = 0
+        render_compact_cycles = 0
+        n_grade_a = n_active
+        n_grade_b = 0
+        n_grade_d = 0
+        if self.cfg.mode >= 3 and self._grade_masks is not None:
+            # CGS path: decompose the single masked render into Grade-A
+            # (full-precision EWA) and Grade-B (SH1 + fp16 compact) and
+            # take their parallel-dispatch maximum as the headline figure.
+            A, B, D = self._grade_masks
+            n_grade_a = int(A.sum().item())
+            n_grade_b = int(B.sum().item())
+            n_grade_d = int(D.sum().item())
+            path_stats = self.grader.render_path_stats(
+                n_grade_a + n_grade_b + n_grade_d,
+                tile_size=tile_size,
+                tile_touches_total=tile_touches,
+            )
+            n_vis_for_cycles = (
+                int(path_stats["n_visible_a"])
+                + int(path_stats["n_visible_b"])
+            )
+            tile_touches_for_cycles = (
+                int(path_stats["tile_touches_a"])
+                + int(path_stats["tile_touches_b"])
+            )
+            graded = self._cycles.add_render_inference_graded(
+                n_grade_a=n_grade_a,
+                n_grade_b=n_grade_b,
+                n_visible_total=n_vis_for_cycles,
+                tile_touches_total=tile_touches_for_cycles,
+                H=H, W=W,
+                sh_degree_full=sh_degree,
+                compact_sh_degree=int(self.cfg.compact_sh_degree),
+                compact_state_byte_scale=float(self.cfg.compact_state_byte_scale),
+                n_visible_a=int(path_stats["n_visible_a"]),
+                n_visible_b=int(path_stats["n_visible_b"]),
+                tile_touches_a=int(path_stats["tile_touches_a"]),
+                tile_touches_b=int(path_stats["tile_touches_b"]),
+            )
+            render_cycles         = int(graded["render_cycles"])
+            render_full_cycles    = int(graded["render_full_cycles"])
+            render_compact_cycles = int(graded["render_compact_cycles"])
+            n_vis = n_vis_for_cycles
+            tile_touches = tile_touches_for_cycles
+            compact_path_ratio = float(self._cycles.compact_primitive_weight(
+                sh_degree_full=sh_degree,
+                compact_sh_degree=int(self.cfg.compact_sh_degree),
+                compact_state_byte_scale=float(self.cfg.compact_state_byte_scale),
+            ))
+            cgs_rho_mean = float(path_stats["rho_mean"])
+            cgs_kappa_mean = float(path_stats["kappa_mean"])
+            cgs_potential_mean = float(path_stats["render_potential_mean"])
+        else:
+            render_cycles = self._cycles.add_render_inference(
+                n_active=n_active,
+                n_visible=n_vis,
+                tile_touches=tile_touches,
+                H=H, W=W,
+                sh_degree=sh_degree,
+            )
+            compact_path_ratio = 0.0
+            cgs_rho_mean = 1.0
+            cgs_kappa_mean = 0.0
+            cgs_potential_mean = 1.0
         asic_fps = (self.cfg.asic_spec.clock_hz / max(render_cycles, 1)) \
                      if render_cycles > 0 else 0.0
 
@@ -1671,14 +1953,23 @@ class GLASSPipeline:
         gpu_fps = self.measure_fps(render_fn, cameras, pipe, bg)
 
         return {
-            "asic_fps":      float(asic_fps),
-            "gpu_fps":       float(gpu_fps),
-            "render_cycles": int(render_cycles),
-            "n_active":      n_active,
-            "n_visible":     n_vis,
-            "tile_touches":  tile_touches,
-            "H":             H,
-            "W":             W,
+            "asic_fps":             float(asic_fps),
+            "gpu_fps":              float(gpu_fps),
+            "render_cycles":        int(render_cycles),
+            "render_full_cycles":   int(render_full_cycles),
+            "render_compact_cycles": int(render_compact_cycles),
+            "n_active":             n_active,
+            "n_visible":            n_vis,
+            "tile_touches":         tile_touches,
+            "n_grade_a":            n_grade_a,
+            "n_grade_b":            n_grade_b,
+            "n_grade_d":            n_grade_d,
+            "compact_path_ratio":   compact_path_ratio,
+            "cgs_rho_mean":         cgs_rho_mean,
+            "cgs_kappa_mean":       cgs_kappa_mean,
+            "cgs_potential_mean":   cgs_potential_mean,
+            "H":                    H,
+            "W":                    W,
         }
 
     # ── Statistics ────────────────────────────────────────────────────────────
@@ -1697,24 +1988,28 @@ class GLASSPipeline:
         if n_gaussians is None:
             n_gaussians = self.slot.n_gaussians()
         fabric_counts  = self.fabric.tier_counts(max(n_gaussians, 1))
-        # The mode-1 fast path also populates the per-frame byte caches
-        # (empty descriptor stream), so reuse the cache when it is non-zero.
-        use_cache = (
-            self.cfg.mode == 0
-            or (self.cfg.mode == 1 and self._frame_total_bytes > 0)
-        )
-        if use_cache:
-            frame_total = self._frame_total_bytes
-            frame_supp = self._frame_suppressed_bytes
-            frame_active = frame_total - frame_supp
-            frame_ratio = (frame_supp / frame_total) if frame_total > 0 else 0.0
-            frame_unique = self._frame_unique_targets
+        # CGS grade counts are exposed here so downstream callers (e.g.
+        # ablation runners that do not route through measure_asic_render_fps)
+        # still see ``n_grade_a / n_grade_b / n_grade_d`` in stream_stats().
+        # Only populated under mode >= 3; mode < 3 returns zero counts.
+        if self.cfg.mode >= 3:
+            grade_counts = self.grader.tier_counts(max(n_gaussians, 1))
         else:
-            frame_total = s.total_bytes()
-            frame_supp = s.suppressed_bytes()
-            frame_active = s.active_bytes()
-            frame_ratio = s.suppression_ratio()
-            frame_unique = len(s.unique_targets())
+            grade_counts = {
+                "n_grade_a": 0, "n_grade_b": 0, "n_grade_d": 0,
+                "n_promote": 0, "n_full": 0, "n_skip": 0,
+            }
+        # Fast paths and dense NTC ingest update the per-frame byte cache;
+        # fallback descriptor paths still write into UpdateStream.  Combine
+        # both so mixed frames remain accurate without forcing dense NTC
+        # streams back through Python descriptor objects.
+        stream_total = s.total_bytes()
+        stream_supp = s.suppressed_bytes()
+        frame_total = self._frame_total_bytes + stream_total
+        frame_supp = self._frame_suppressed_bytes + stream_supp
+        frame_active = frame_total - frame_supp
+        frame_ratio = (frame_supp / frame_total) if frame_total > 0 else 0.0
+        frame_unique = max(self._frame_unique_targets, len(s.unique_targets()))
         return {
             # Per-frame (last frame)
             "frame_total_bytes":      frame_total,
@@ -1727,6 +2022,9 @@ class GLASSPipeline:
             "run_suppressed_bytes":   self._suppressed_bytes_all,
             # Fabric tier counts
             **fabric_counts,
+            # CGS grade counts (legacy n_promote/n_full/n_skip aliases
+            # kept in the same dict).
+            **grade_counts,
         }
 
     # ── Cycle-accurate timing ─────────────────────────────────────────────────
@@ -1777,7 +2075,7 @@ class GLASSPipeline:
     ) -> tuple[int, float]:
         """Per-mode active-Gaussian count the ASIC train render backend sees.
 
-        GLASS §6 ("Dual-Consumer Access") and §5.4 ("Salience-First
+        GLASS §6 ("Dual-Consumer Access") and §5.4 ("Convergence-Graded
         Issue") state that update- and render-side consumers share the
         same on-fabric residency — i.e. **training-time** render +
         backward passes must see exactly the same ASC∪RSB∪FULL subset
@@ -1795,11 +2093,11 @@ class GLASSPipeline:
         +----------+-------------------------------------------------------+
         | mode 0/1 | no fabric mask on train render ⇒ n_active = n_total  |
         | mode 2   | hot tier only (ASC ∪ hot-RSB)                        |
-        | mode 3   | further intersected with salience keep mask          |
+        | mode 3   | further intersected with CGS Grade-A/B keep mask     |
         +----------+-------------------------------------------------------+
 
         All masks are sourced live from :class:`LiveStateFabric` and
-        :class:`SalienceFirstIssue`; no scaling constants are
+        :class:`ConvergenceGrader`; no scaling constants are
         introduced.  The lower bound of ``max(1, n_active)`` matches
         :meth:`make_render_proxy`'s "always render at least one
         Gaussian" invariant so that the cycle model never collapses to
@@ -1825,8 +2123,37 @@ class GLASSPipeline:
             return max(1, n_total), 1.0
         mask = self.fabric.get_render_mask(n_total)
         if self.cfg.mode >= 3:
-            keep, _ = self.salience.classify(n_total)
-            mask = mask & keep
+            # CGS: Grade-A pays full per-primitive cost, Grade-B pays a
+            # Compact-to-Full ratio that is **derived** from the same
+            # EWA Phase-1/2/3 formulas the headline inference path uses
+            # (see ``CycleAccumulator.compact_primitive_weight``); Grade-D
+            # pays zero.  No hardcoded "0.33" — the weight follows
+            # directly from ``compact_sh_degree`` + ``compact_state_byte_scale``
+            # and automatically stays consistent with inference cycles.
+            A, B, _D = self.grader.assign_grades(n_total, flush_pending=False)
+            A = A & mask
+            B = B & mask
+            n_a = int(A.sum().item())
+            n_b = int(B.sum().item())
+            # Probe the live model's SH degree — 3DGS-style baselines
+            # expose ``active_sh_degree``; fall back to the 3DGS default
+            # (SH3) when the accessor is missing (e.g. HiCoM's merged
+            # rasteriser stub) rather than introducing a config knob.
+            sh_deg_full = int(getattr(
+                self.slot.get_gaussians(), "active_sh_degree", 3,
+            ))
+            compact_ratio = self._cycles.compact_primitive_weight(
+                sh_degree_full=sh_deg_full,
+                compact_sh_degree=int(self.cfg.compact_sh_degree),
+                compact_state_byte_scale=float(self.cfg.compact_state_byte_scale),
+            )
+            weighted = n_a + compact_ratio * n_b
+            n_active = max(1, min(n_total, int(round(weighted))))
+            # ``active_ratio`` here controls how ``n_visible`` /
+            # ``tile_touches`` scale downstream; keep it consistent
+            # with the weighted primitive count above.
+            ratio = weighted / max(n_total, 1)
+            return n_active, max(1e-6, min(1.0, ratio))
         n_active = int(mask.sum().item())
         # Mirror make_render_proxy()'s "at least one Gaussian" floor so
         # the first few frames (before fabric hotness converges) never
@@ -1848,7 +2175,7 @@ class GLASSPipeline:
 
         Mode-awareness:
           ``_train_render_active_counts`` caps ``n``, ``n_visible`` and
-          ``tile_touches`` at the fabric (mode ≥ 2) and salience (mode ≥ 3)
+          ``tile_touches`` at the fabric (mode ≥ 2) and CGS (mode ≥ 3)
           residency under the same rule as :meth:`make_render_proxy`.
           Mode 0 / 1 are unaffected (``active_ratio = 1.0``).
 
@@ -1936,6 +2263,7 @@ class GLASSPipeline:
         self.fabric.reset()
         self.salience.reset()
         self._cycles.reset()
+        self._cgs_frame_update_max = None
         self._n_gs_active          = 0
         self._version              = 0
         self._stream               = UpdateStream()

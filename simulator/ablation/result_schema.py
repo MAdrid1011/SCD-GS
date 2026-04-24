@@ -56,7 +56,7 @@ MODE_LABELS: dict[int, str] = {
     0: "Base ASIC",
     1: "+UCN",
     2: "+ILSF",
-    3: "+Salience",
+    3: "+CGS",  # Convergence-Graded Splatting (legacy "+Salience" label)
 }
 
 
@@ -104,6 +104,27 @@ SCHEMA_KEYS: tuple[str, ...] = (
     "render_H",
     "render_W",
 
+    # ── Convergence-Graded Splatting diagnostics (mode 3 only) ───────
+    # n_grade_a / n_grade_b / n_grade_d   — CGS three-way grade counts
+    # compact_path_ratio                  — Grade-B per-primitive cost
+    #                                       relative to Grade-A
+    # render_full_cycles / render_compact_cycles
+    #                                     — per-path cycle breakdown
+    #                                       that sums (via max) to
+    #                                       asic_render_cycles
+    # Legacy aliases still present in asic_cycle breakdown below:
+    #   asic_salience_cycles  — stays populated as the Stage-4
+    #                           support-domain evaluator bucket.
+    "n_grade_a",
+    "n_grade_b",
+    "n_grade_d",
+    "compact_path_ratio",
+    "cgs_rho_mean",
+    "cgs_kappa_mean",
+    "cgs_potential_mean",
+    "render_full_cycles",
+    "render_compact_cycles",
+
     # ── Storage ──────────────────────────────────────────────────────
     "total_storage_mb",
     "delta_storage_mb",
@@ -131,6 +152,12 @@ SCHEMA_KEYS: tuple[str, ...] = (
     "asic_salience_cycles",
     "asic_optimizer_cycles",
     "asic_render_cycles",
+    # CGS per-path cycle breakdown (zero when mode < 3).  Their
+    # ``max`` equals ``asic_render_cycles`` under CGS because the
+    # hardware dispatcher runs the Full / Compact paths on
+    # independent warp / tile queues.
+    "asic_render_full_cycles",
+    "asic_render_compact_cycles",
     "asic_gradient_pipeline_cycles",
     "asic_post_render_cycles",
     "asic_total_cycles",
@@ -252,6 +279,20 @@ def build_result(
         "render_H":                    diag.get("H"),
         "render_W":                    diag.get("W"),
 
+        # Convergence-Graded Splatting diagnostics (mode 3 only; older
+        # ``n_promote / n_full / n_skip`` field names are still
+        # produced by :meth:`ConvergenceGrader.tier_counts` under
+        # ``stream_stats`` so downstream analysis scripts keep working).
+        "n_grade_a":                   diag.get("n_grade_a", 0),
+        "n_grade_b":                   diag.get("n_grade_b", 0),
+        "n_grade_d":                   diag.get("n_grade_d", 0),
+        "compact_path_ratio":          diag.get("compact_path_ratio", 0.0),
+        "cgs_rho_mean":                diag.get("cgs_rho_mean", 1.0),
+        "cgs_kappa_mean":              diag.get("cgs_kappa_mean", 0.0),
+        "cgs_potential_mean":          diag.get("cgs_potential_mean", 1.0),
+        "render_full_cycles":          diag.get("render_full_cycles", 0),
+        "render_compact_cycles":       diag.get("render_compact_cycles", 0),
+
         # Storage
         "total_storage_mb":            total_storage_mb,
         "delta_storage_mb":            delta_storage_mb,
@@ -271,6 +312,8 @@ def build_result(
         "asic_salience_cycles":        cycle_summary.get("asic_salience_cycles", 0),
         "asic_optimizer_cycles":       cycle_summary.get("asic_optimizer_cycles", 0),
         "asic_render_cycles":          cycle_summary.get("asic_render_cycles", 0),
+        "asic_render_full_cycles":     cycle_summary.get("asic_render_full_cycles", 0),
+        "asic_render_compact_cycles":  cycle_summary.get("asic_render_compact_cycles", 0),
         "asic_gradient_pipeline_cycles":cycle_summary.get("asic_gradient_pipeline_cycles", 0),
         "asic_post_render_cycles":     cycle_summary.get("asic_post_render_cycles", 0),
         "asic_total_cycles":           cycle_summary.get("asic_total_cycles", 0),

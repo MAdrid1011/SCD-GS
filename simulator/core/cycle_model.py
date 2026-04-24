@@ -21,8 +21,8 @@ Parallelism rules encoded in summary()
      memory region and completes well within one ICE step → 0 extra cycles.
   4. ICE_scale + ICE_cold_mask are merged into a single read-modify-write pass
      (mode >= 2) via add_ice_merged(), saving ~33% memory bandwidth.
-  5. ILSF_render and Salience execute in parallel after render(); critical path
-     = max(ILSF_render, Salience).
+  5. ILSF_render and CGS support-domain bookkeeping execute in parallel after
+     render(); critical path = max(ILSF_render, Stage4_CGS).
 """
 from __future__ import annotations
 
@@ -125,6 +125,12 @@ class CycleAccumulator:
             "salience":    0,
             "optimizer":   0,
             "render":      0,
+            # ── Convergence-Graded Splatting diagnostics (mode 3) ──
+            # Populated by :meth:`add_render_inference_graded`; zero when
+            # CGS is inactive.  ``render`` above still reports the single
+            # headline cycle count (max over the two paths + composite).
+            "render_full":    0,
+            "render_compact": 0,
         }
 
     # ── ASIC overhead counting methods ────────────────────────────────────────
@@ -301,7 +307,7 @@ class CycleAccumulator:
         """ILSF hotness update from render visibility (called post-render).
 
         Same computation as add_ilsf_update but driven by the visibility
-        filter rather than gradient norms.  Runs in parallel with Salience
+        filter rather than gradient norms.  Runs in parallel with CGS support
         (different input, different output memory).
 
             cycles = ceil(n_visible / mac_units) + ceil(n_visible×4 / sram_bw)
@@ -335,27 +341,31 @@ class CycleAccumulator:
         return cyc
 
     def add_salience(self, n: int) -> int:
-        """Salience score EMA update (called post-render, mode >= 3).
+        """Stage-4 CGS support-domain update (called post-render, mode >= 3).
 
-        Per Gaussian (3 ops):
-          1 MUL  — raw_score = opacity × radii
-          1 DIV  — normalise by max_radii
-          1 FMA  — EMA: score ← α×score + (1−α)×raw_score
+        The schema keeps the historical ``salience`` bucket name, but the
+        modeled work is now the support-domain evaluator:
+
+          support_area ~= pi * radii^2
+          raw_p        = opacity * support_area * appearance_bound
+          P            = saturate(raw_p / P_ref)
+          rho          = 1 - lambda * kappa * (1 - P)
+          Omega_CGS    = rho * support_area
 
         Memory:
-          read  = ceil(N×8 / sram_bw)   ← radii (4B) + opacity (4B)
-          write = ceil(N×4 / sram_bw)   ← updated score
+          read  = ceil(N×16 / sram_bw)  ← radii, opacity, appearance, kappa
+          write = ceil(N×8 / sram_bw)   ← rho/effective support or grade meta
 
-            cycles = max(ceil(N×8/bw), ceil(N×3/mac_units)) + ceil(N×4/bw)
+            cycles = max(ceil(N×16/bw), ceil(N×12/mac_units)) + ceil(N×8/bw)
 
         Runs in parallel with ILSF_render (disjoint inputs and outputs).
         """
         if n == 0:
             return 0
         s = self.spec
-        mem_rd  = _ceil(n * 8, s.sram_bw_bytes)
-        compute = _ceil(n * 3, s.mac_units)
-        write   = _ceil(n * 4, s.sram_bw_bytes)
+        mem_rd  = _ceil(n * 16, s.sram_bw_bytes)
+        compute = _ceil(n * 12, s.mac_units)
+        write   = _ceil(n * 8, s.sram_bw_bytes)
         cyc     = max(mem_rd, compute) + write
         self._cyc["salience"] += cyc
         return cyc
@@ -891,6 +901,230 @@ class CycleAccumulator:
         self._cyc["render"] = cyc
         return cyc
 
+    def _render_phase123_cycles(
+        self,
+        n_active: int,
+        n_visible: int,
+        tile_touches: int,
+        H: int,
+        W: int,
+        sh_degree: int,
+        state_byte_scale: float,
+    ) -> int:
+        """Shared EWA splatting Phase-1/2/3 cycle model.
+
+        The Full and Compact render paths differ only in:
+          • ``sh_degree`` — controls SH parameter count (and therefore the
+            colour-MAC budget + per-primitive state-read byte count);
+          • ``state_byte_scale`` — fp16 → 0.5 halves Phase 1 / Phase 3
+            state-read bandwidth (compute is unaffected).
+
+        There is deliberately **no** additional ``compute_scale``
+        multiplier: the colour / per-primitive MAC savings of a lower SH
+        degree already fall out of the ``sh_params`` term, and the
+        α-compositing inner loop (``tile_touches * 19`` MACs) is
+        SH-independent.  Scaling α-compositing compute by an extra fudge
+        factor would introduce a magic number and would overstate the
+        Compact path's savings.
+        """
+        if n_active == 0:
+            return 0
+        s = self.spec
+        sh_params = 3 * (sh_degree + 1) ** 2
+        sh_macs   = sh_params
+        cov_macs  = 15
+        proj_macs = 4
+        per_g_macs = sh_macs + cov_macs + proj_macs
+
+        p1c = _ceil(n_active * per_g_macs, s.mac_units)
+        p1r = _ceil(
+            int(n_active * (11 + sh_params) * 4 * state_byte_scale),
+            s.dram_bw_bytes,
+        )
+        p1w = _ceil(max(n_visible, 0) * 10 * 4, s.dram_bw_bytes)
+        ph1 = max(p1c, p1r) + p1w
+
+        p2c = _ceil(tile_touches * 32, s.cmp_units)
+        p2b = _ceil(tile_touches * 8 * 2, s.dram_bw_bytes)
+        ph2 = max(p2c, p2b)
+
+        p3c = _ceil(tile_touches * 19, s.mac_units)
+        p3r = _ceil(
+            int(tile_touches * 9 * 4 * state_byte_scale),
+            s.dram_bw_bytes,
+        )
+        p3w = _ceil(H * W * 3 * 4, s.dram_bw_bytes)
+        ph3 = max(p3c, p3r) + p3w
+
+        return ph1 + ph2 + ph3
+
+    def compact_primitive_weight(
+        self,
+        sh_degree_full: int = 3,
+        compact_sh_degree: int = 1,
+        compact_state_byte_scale: float = 0.5,
+        probe_n: int = 1_048_576,
+    ) -> float:
+        """Per-primitive Compact-to-Full cycle ratio, derived from the
+        same EWA Phase-1/2/3 formulas used by the graded inference path.
+
+        Needed anywhere the pipeline has to count "effective" primitives
+        (e.g. weighting Grade-B primitives in training-side render cycle
+        accounting) without hardcoding the headline 0.33× cost fudge.
+
+        Method: render the same probe workload through
+        :meth:`_render_phase123_cycles` twice — once with the Full-path
+        parameters, once with the Compact-path parameters — and return
+        the ratio.  A large ``probe_n`` is used so that fixed-cost terms
+        (framebuffer write, radix-sort floor) are amortised and the
+        result is dominated by the per-primitive terms, matching the
+        usage pattern in
+        :meth:`~glass_sim.pipeline.GLASS._train_render_active_counts`.
+
+        Returns a ratio strictly in ``(0, 1]``.
+        """
+        # Probe geometry is deliberately simple: every primitive is
+        # visible and hits exactly one tile.  The absolute cycle
+        # numbers here are never surfaced — only the ratio is used.
+        n         = max(1, int(probe_n))
+        n_visible = n
+        tiles     = n
+        # Pick an H/W that won't dominate p3_write — 256×256 keeps the
+        # framebuffer term << per-primitive terms for probe_n = 1M.
+        H = W = 256
+
+        full = self._render_phase123_cycles(
+            n, n_visible, tiles, H, W,
+            sh_degree=sh_degree_full,
+            state_byte_scale=1.0,
+        )
+        compact = self._render_phase123_cycles(
+            n, n_visible, tiles, H, W,
+            sh_degree=compact_sh_degree,
+            state_byte_scale=compact_state_byte_scale,
+        )
+        if full <= 0:
+            return 1.0
+        return max(1e-6, min(1.0, compact / full))
+
+    def add_render_inference_graded(
+        self,
+        n_grade_a: int,
+        n_grade_b: int,
+        n_visible_total: int,
+        tile_touches_total: int,
+        H: int,
+        W: int,
+        sh_degree_full: int,
+        compact_sh_degree: int = 1,
+        compact_state_byte_scale: float = 0.5,
+        n_visible_a: int | None = None,
+        n_visible_b: int | None = None,
+        tile_touches_a: int | None = None,
+        tile_touches_b: int | None = None,
+    ) -> dict[str, int]:
+        """ASIC per-frame INFERENCE render cycles under Convergence-Graded
+        Splatting (CGS).
+
+        The Grade-A (LivePrecise) path keeps the standard EWA splatting
+        pipeline — SH :math:`L=` ``sh_degree_full`` colour, fp32 state.
+        The Grade-B (StableCompact) path uses SH :math:`L=`
+        ``compact_sh_degree`` colour (default SH1: 1 direction × 3
+        channels vs SH3's 16 × 3) and fp16 state reads
+        (``compact_state_byte_scale=0.5``).  Both savings propagate
+        *through the existing Phase 1/3 formulas* (see
+        :meth:`_render_phase123_cycles`) rather than via a single
+        hardcoded "compact cost ratio" multiplier — the Compact-to-Full
+        ratio is an *emergent* property of the cycle model, not a magic
+        knob.  Grade-D primitives are pre-pruned by the dispatcher and
+        never enter either path.
+
+        Since the hardware primitive dispatcher fans out the two paths to
+        independent warp / tile queues (GLASS §8), the critical path is
+        ``max(full_cycles, compact_cycles)``; the Phase 4 final composite
+        that merges the two framebuffers shares bandwidth with Phase 3's
+        write already counted inside each path (no additional cycles).
+
+        Parameters
+        ----------
+        n_grade_a, n_grade_b
+            Gaussian counts assigned to the Full / Compact paths.  The
+            legacy ``add_render_inference`` method's ``n_active`` is
+            ``n_grade_a + n_grade_b``.
+        n_visible_total, tile_touches_total
+            Aggregate visibility / tile-touch statistics observed from
+            the masked-proxy render.  When per-grade support statistics are
+            provided, they take precedence and directly model support-domain
+            shrink before tile expansion.  Otherwise the split falls back to
+            the legacy A:B count ratio approximation.
+        H, W, sh_degree_full
+            Identical to :meth:`add_render_inference`.
+        compact_sh_degree, compact_state_byte_scale
+            Compact-path design knobs.  Defaults match
+            :class:`~glass_sim.config.ASICConfig` and stay in sync with
+            :meth:`compact_primitive_weight` so derived diagnostics
+            (``compact_path_ratio``) agree with observed run-time cycles.
+
+        Returns
+        -------
+        dict with keys ``render_full_cycles``, ``render_compact_cycles``,
+        and ``render_cycles`` (== ``max`` of the two).  ``_cyc["render"]``
+        is overwritten to the headline ``render_cycles`` so downstream
+        FPS / summary consumers stay schema-compatible.
+        """
+        n_total = n_grade_a + n_grade_b
+        if n_total <= 0:
+            self._cyc["render_full"] = 0
+            self._cyc["render_compact"] = 0
+            self._cyc["render"] = 0
+            return {
+                "render_full_cycles":    0,
+                "render_compact_cycles": 0,
+                "render_cycles":         0,
+            }
+
+        if (
+            n_visible_a is not None
+            and n_visible_b is not None
+            and tile_touches_a is not None
+            and tile_touches_b is not None
+        ):
+            vis_a = max(0, int(n_visible_a))
+            vis_b = max(0, int(n_visible_b))
+            tt_a = max(0, int(tile_touches_a))
+            tt_b = max(0, int(tile_touches_b))
+        else:
+            a_frac = n_grade_a / n_total
+            vis_a = int(round(n_visible_total * a_frac))
+            vis_b = max(0, n_visible_total - vis_a)
+            tt_a = int(round(tile_touches_total * a_frac))
+            tt_b = max(0, tile_touches_total - tt_a)
+
+        full_cyc = self._render_phase123_cycles(
+            n_grade_a, vis_a, tt_a, H, W,
+            sh_degree=sh_degree_full,
+            state_byte_scale=1.0,
+        )
+        compact_cyc = self._render_phase123_cycles(
+            n_grade_b, vis_b, tt_b, H, W,
+            sh_degree=compact_sh_degree,
+            state_byte_scale=compact_state_byte_scale,
+        )
+
+        # Independent warp / tile queues → the two paths run in parallel;
+        # headline latency is the slower of the two.
+        cyc = max(full_cyc, compact_cyc)
+
+        self._cyc["render_full"]    = full_cyc
+        self._cyc["render_compact"] = compact_cyc
+        self._cyc["render"]         = cyc
+
+        return {
+            "render_full_cycles":    full_cyc,
+            "render_compact_cycles": compact_cyc,
+            "render_cycles":         cyc,
+        }
+
     def set_render_cycles_from_fps(self, fps: float) -> None:
         """(Legacy) back-calculate render cycles from a measured GPU FPS.
 
@@ -977,6 +1211,12 @@ class CycleAccumulator:
             "asic_salience_cycles":           self._cyc["salience"],
             "asic_optimizer_cycles":          self._cyc["optimizer"],
             "asic_render_cycles":             self._cyc["render"],
+            # CGS diagnostics — zero when mode < 3 or the graded render
+            # path was not exercised.  ``asic_render_cycles`` is the
+            # headline figure; the per-path breakdown below is for
+            # ablation plots that decompose Full vs Compact work.
+            "asic_render_full_cycles":        self._cyc["render_full"],
+            "asic_render_compact_cycles":     self._cyc["render_compact"],
             "asic_gradient_pipeline_cycles":  gradient_pipeline,
             "asic_post_render_cycles":        post_render,
             "asic_total_cycles":              total,
