@@ -201,9 +201,8 @@ def run_one_mode(mode: int, ds_cfg, n_frames: int | None = None) -> dict:
                 is_first_ablation_frame = (current_frame == first_incr)
                 if mode >= 1 and not is_first_ablation_frame:
                     prev_ratio = pipeline.current_frame_suppression_ratio()
-                    adaptive_steps = max(
-                        int(config.min_ntc_iters_floor),
-                        round(n_iters_per_frame * (1.0 - prev_ratio)),
+                    adaptive_steps = pipeline.scheduled_train_iters(
+                        n_iters_per_frame, prev_ratio
                     )
                 else:
                     adaptive_steps = n_iters_per_frame

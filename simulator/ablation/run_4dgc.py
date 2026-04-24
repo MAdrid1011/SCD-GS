@@ -237,9 +237,8 @@ def run_one_mode(mode: int, ds_cfg) -> dict:
             # ── Adaptive MEM iteration scheduling (lag-one) ──
             if mode >= 1 and frame_idx > 0:
                 prev_ratio     = pipeline._prev_suppression_ratio
-                adaptive_iters = max(
-                    config.min_ntc_iters_floor,
-                    round(base_iters * (1.0 - prev_ratio)),
+                adaptive_iters = pipeline.scheduled_train_iters(
+                    base_iters, prev_ratio
                 )
             else:
                 adaptive_iters = base_iters
