@@ -74,7 +74,14 @@ def build_table() -> dict:
 
 def as_markdown(table: dict) -> str:
     lines: list[str] = []
-    lines.append("# GLASS ASIC Ablation — flame_steak (10 frames)\n")
+    lines.append("# GLASS ASIC Ablation — flame_steak\n")
+    lines.append(
+        "> **Note**: The `Frames` column reflects the *actual* `n_frames_trained` "
+        "recorded in each `mode_*.json`. Modes may have been collected across "
+        "different simulator revisions; any row whose Frames ≠ 10 is legacy "
+        "baseline data kept for reference and should not be compared "
+        "apples-to-apples with the 10-frame rows (see GLASS.md §A.6).\n"
+    )
     lines.append(
         "| Baseline | Mode | Frames | ASIC train/frame (s) "
         "| Render FPS | PSNR | SSIM | LPIPS | Total storage (MB) | Δ stream (MB) |"

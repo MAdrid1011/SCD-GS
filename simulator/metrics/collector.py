@@ -99,9 +99,10 @@ class MetricsCollector:
     ) -> float:
         """Measure render FPS by delegating to the pipeline.
 
-        All masking logic (LiveStateFabric + SalienceFirstIssue) is applied
-        inside pipeline.measure_fps() via make_render_proxy(), so the measured
-        FPS correctly reflects the active ablation mode.
+        All masking logic (LiveStateFabric + Convergence-Graded Splatting
+        grader) is applied inside pipeline.measure_fps() via
+        make_render_proxy(), so the measured FPS correctly reflects the
+        active ablation mode.
 
         Parameters
         ----------

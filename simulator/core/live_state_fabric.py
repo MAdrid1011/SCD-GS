@@ -55,20 +55,45 @@ class LiveStateFabric:
 
     def __init__(self, config: "ASICConfig") -> None:
         self.cfg = config
-        # Hotness scores: dict[int, float] persists across frames
-        self._hotness: dict[int, float] = {}
-        # Most recent per-Gaussian delta_norm (set during record_update)
-        self._recent_delta: dict[int, float] = {}
+        # Tensor-backed per-Gaussian state.  Earlier simulator revisions kept
+        # these as Python dicts and sorted lists of IDs, which became a host
+        # bottleneck for NTC baselines with hundreds of thousands of Gaussians.
+        self._hotness: torch.Tensor | None = None
+        self._recent_delta: torch.Tensor | None = None
+        self._known: torch.Tensor | None = None
+        self._ucn_streak: torch.Tensor | None = None
         # Cached mask from last get_render_mask() call
         self._cached_mask: torch.BoolTensor | None = None
         self._cached_n: int = 0
-        # UCN-demotion streak: per-Gaussian count of consecutive frames in
-        # which UCN suppressed this Gaussian.  Populated by record_ucn_
-        # suppression(); reset to 0 by record_update when a non-suppressed
-        # gradient event arrives.  Consumed inside record_update to decide
-        # whether the hotness reward is applied (streak < threshold) or
-        # skipped (streak ≥ threshold — let hotness decay via EMA).
-        self._ucn_streak: dict[int, int] = {}
+
+    def _ensure_capacity(self, n_gaussians: int) -> None:
+        if n_gaussians <= 0:
+            return
+        if self._hotness is None:
+            self._hotness = torch.zeros(n_gaussians, dtype=torch.float32)
+            self._recent_delta = torch.zeros(n_gaussians, dtype=torch.float32)
+            self._known = torch.zeros(n_gaussians, dtype=torch.bool)
+            self._ucn_streak = torch.zeros(n_gaussians, dtype=torch.int32)
+            return
+        if self._hotness.shape[0] >= n_gaussians:
+            return
+        add = n_gaussians - self._hotness.shape[0]
+        self._hotness = torch.cat([
+            self._hotness,
+            torch.zeros(add, dtype=self._hotness.dtype),
+        ])
+        self._recent_delta = torch.cat([
+            self._recent_delta,
+            torch.zeros(add, dtype=self._recent_delta.dtype),
+        ])
+        self._known = torch.cat([
+            self._known,
+            torch.zeros(add, dtype=self._known.dtype),
+        ])
+        self._ucn_streak = torch.cat([
+            self._ucn_streak,
+            torch.zeros(add, dtype=self._ucn_streak.dtype),
+        ])
 
     # ── Score updates ─────────────────────────────────────────────────────────
 
@@ -83,11 +108,19 @@ class LiveStateFabric:
         Either way — reward applied or not — reaching this function means
         a non-suppressed gradient arrived, so the streak is reset to 0.
         """
+        if gid < 0:
+            return
+        self._ensure_capacity(gid + 1)
+        assert self._hotness is not None
+        assert self._recent_delta is not None
+        assert self._known is not None
+        assert self._ucn_streak is not None
+
         alpha = self.cfg.hotness_alpha
-        old = self._hotness.get(gid, 0.0)
+        old = float(self._hotness[gid].item())
         if (
             self.cfg.ucn_drive_fabric_demotion
-            and self._ucn_streak.get(gid, 0) >= self.cfg.ucn_demotion_streak
+            and int(self._ucn_streak[gid].item()) >= self.cfg.ucn_demotion_streak
         ):
             # Long-suppressed Gaussian just came back; decay-only this step
             # (no reward injection) so it has to earn its way back into the
@@ -97,11 +130,11 @@ class LiveStateFabric:
         else:
             reward = self.cfg.hotness_update_reward
             self._hotness[gid] = alpha * old + (1.0 - alpha) * reward
-        self._recent_delta[gid] = max(
-            self._recent_delta.get(gid, 0.0), delta_norm
-        )
+        self._recent_delta[gid] = max(float(self._recent_delta[gid].item()), delta_norm)
+        self._known[gid] = True
         if self.cfg.ucn_drive_fabric_demotion:
             self._ucn_streak[gid] = 0
+        self._cached_mask = None
 
     def record_ucn_suppression(self, gid: int) -> None:
         """Report that UCN suppressed this Gaussian's update this frame.
@@ -118,7 +151,78 @@ class LiveStateFabric:
         """
         if not self.cfg.ucn_drive_fabric_demotion:
             return
-        self._ucn_streak[gid] = self._ucn_streak.get(gid, 0) + 1
+        if gid < 0:
+            return
+        self._ensure_capacity(gid + 1)
+        assert self._ucn_streak is not None
+        self._ucn_streak[gid] = self._ucn_streak[gid] + 1
+
+    def record_updates_bulk(
+        self,
+        delta_norms: torch.Tensor,
+        grad_scale: torch.Tensor | None = None,
+    ) -> None:
+        """Vectorized update/suppression feed for dense per-Gaussian paths.
+
+        ``grad_scale`` follows the descriptor semantics: rows with
+        ``grad_scale <= 0`` are UCN-suppressed and therefore only advance the
+        demotion streak; rows with positive scale receive the normal hotness
+        reward and update ``recent_delta``.
+        """
+        if delta_norms.numel() == 0:
+            return
+        norms = delta_norms.detach().reshape(-1).to("cpu", dtype=torch.float32)
+        n = int(norms.shape[0])
+        self._ensure_capacity(n)
+        assert self._hotness is not None
+        assert self._recent_delta is not None
+        assert self._known is not None
+        assert self._ucn_streak is not None
+
+        active = norms > 0.0
+        if not bool(active.any().item()):
+            return
+
+        if grad_scale is None:
+            pass_mask = active
+            suppressed = torch.zeros_like(active)
+        else:
+            scale = grad_scale.detach().reshape(-1).to("cpu", dtype=torch.float32)
+            if scale.shape[0] != n:
+                scale = torch.ones(n, dtype=torch.float32)
+            pass_mask = active & (scale > 0.0)
+            suppressed = active & (scale <= 0.0)
+
+        if self.cfg.ucn_drive_fabric_demotion and bool(suppressed.any().item()):
+            self._ucn_streak[:n][suppressed] += 1
+
+        if bool(pass_mask.any().item()):
+            alpha = float(self.cfg.hotness_alpha)
+            old = self._hotness[:n][pass_mask]
+            if self.cfg.ucn_drive_fabric_demotion:
+                demoted = (
+                    self._ucn_streak[:n][pass_mask]
+                    >= int(self.cfg.ucn_demotion_streak)
+                )
+                rewarded = alpha * old + (
+                    1.0 - alpha
+                ) * float(self.cfg.hotness_update_reward)
+                decayed = alpha * old
+                self._hotness[:n][pass_mask] = torch.where(
+                    demoted, decayed, rewarded
+                )
+                self._ucn_streak[:n][pass_mask] = 0
+            else:
+                self._hotness[:n][pass_mask] = alpha * old + (
+                    1.0 - alpha
+                ) * float(self.cfg.hotness_update_reward)
+
+            self._recent_delta[:n][pass_mask] = torch.maximum(
+                self._recent_delta[:n][pass_mask],
+                norms[pass_mask],
+            )
+            self._known[:n][pass_mask] = True
+            self._cached_mask = None
 
     def record_render(self, visibility_filter: torch.BoolTensor) -> None:
         """Update hotness for all Gaussians visible in the last render.
@@ -128,21 +232,38 @@ class LiveStateFabric:
         visibility_filter : BoolTensor, shape [N]
             True for Gaussians that contributed to the rendered image.
         """
+        if visibility_filter.numel() == 0:
+            return
+        vf = visibility_filter.detach().reshape(-1).to("cpu", dtype=torch.bool)
+        n = int(vf.shape[0])
+        self._ensure_capacity(n)
+        assert self._hotness is not None
+        assert self._known is not None
+        if not bool(vf.any().item()):
+            return
         alpha  = self.cfg.hotness_alpha
         reward = self.cfg.hotness_render_reward
-        # Iterate only visible indices to keep this O(visible) not O(N)
-        visible_ids = visibility_filter.nonzero(as_tuple=False).squeeze(1)
-        for gid in visible_ids.tolist():
-            old = self._hotness.get(gid, 0.0)
-            self._hotness[gid] = alpha * old + (1.0 - alpha) * reward
+        old = self._hotness[:n][vf]
+        self._hotness[:n][vf] = alpha * old + (1.0 - alpha) * reward
+        self._known[:n][vf] = True
         # Invalidate cached mask (scene has changed)
         self._cached_mask = None
 
     # ── Tier classification ───────────────────────────────────────────────────
 
-    def _sorted_ids(self) -> list[int]:
+    def _sorted_ids(self, n_gaussians: int) -> torch.Tensor:
         """Return all known Gaussian IDs sorted by descending hotness."""
-        return sorted(self._hotness, key=lambda k: -self._hotness[k])
+        if n_gaussians <= 0:
+            return torch.empty(0, dtype=torch.long)
+        self._ensure_capacity(n_gaussians)
+        assert self._hotness is not None
+        assert self._known is not None
+        known = self._known[:n_gaussians]
+        if not bool(known.any().item()):
+            return torch.empty(0, dtype=torch.long)
+        ids = known.nonzero(as_tuple=False).squeeze(1)
+        order = torch.argsort(self._hotness[ids], descending=True)
+        return ids[order]
 
     def get_render_mask(self, n_gaussians: int) -> torch.BoolTensor:
         """Boolean mask: True for Gaussians that should be rendered.
@@ -161,22 +282,23 @@ class LiveStateFabric:
             return self._cached_mask
 
         mask = torch.zeros(n_gaussians, dtype=torch.bool)
-
-        sorted_ids = self._sorted_ids()
+        if n_gaussians <= 0:
+            return mask
+        sorted_ids = self._sorted_ids(n_gaussians)
+        assert self._recent_delta is not None
 
         # ASC tier: top asb_capacity
         asc_end = min(self.cfg.asb_capacity, len(sorted_ids))
-        for gid in sorted_ids[:asc_end]:
-            if gid < n_gaussians:
-                mask[gid] = True
+        if asc_end > 0:
+            mask[sorted_ids[:asc_end]] = True
 
         # RSB tier: next rsb_capacity, filtered by delta threshold
         rsb_end = min(asc_end + self.cfg.rsb_capacity, len(sorted_ids))
-        for gid in sorted_ids[asc_end:rsb_end]:
-            if gid < n_gaussians:
-                delta = self._recent_delta.get(gid, 0.0)
-                if delta > self.cfg.rsb_delta_thresh:
-                    mask[gid] = True
+        if rsb_end > asc_end:
+            rsb_ids = sorted_ids[asc_end:rsb_end]
+            keep = self._recent_delta[rsb_ids] > float(self.cfg.rsb_delta_thresh)
+            if bool(keep.any().item()):
+                mask[rsb_ids[keep]] = True
 
         self._cached_mask = mask
         self._cached_n    = n_gaussians
@@ -197,7 +319,8 @@ class LiveStateFabric:
         This ensures the RSB threshold is evaluated on current-frame activity
         rather than cumulative history.
         """
-        self._recent_delta.clear()
+        if self._recent_delta is not None:
+            self._recent_delta.zero_()
         self._cached_mask = None
 
     # ── Statistics ────────────────────────────────────────────────────────────
@@ -206,10 +329,14 @@ class LiveStateFabric:
         """Return counts for each tier given current hotness scores."""
         mask = self.get_render_mask(n_gaussians)
         n_active = int(mask.sum().item())
+        if self._known is None:
+            n_known = 0
+        else:
+            n_known = int(self._known[:n_gaussians].sum().item())
         return {
             "n_asc_rsb": n_active,
             "n_css":     n_gaussians - n_active,
-            "n_known":   min(len(self._hotness), n_gaussians),
+            "n_known":   n_known,
             "n_total":   n_gaussians,
         }
 
@@ -220,17 +347,19 @@ class LiveStateFabric:
         attribute set is approximated as 6 attrs × 4 bytes (xyz, rot, scale,
         opacity, features_dc, features_rest_sum). This is a rough lower bound.
         """
-        n_active = min(
-            self.cfg.asb_capacity + self.cfg.rsb_capacity,
-            len(self._hotness),
-        )
+        if self._known is None:
+            n_known = 0
+        else:
+            n_known = int(self._known.sum().item())
+        n_active = min(self.cfg.asb_capacity + self.cfg.rsb_capacity, n_known)
         # 6 float32 attribute scalars per Gaussian (rough approximation)
         return n_active * 6 * 4
 
     def reset(self) -> None:
         """Clear all state. Called between ablation runs."""
-        self._hotness.clear()
-        self._recent_delta.clear()
-        self._ucn_streak.clear()
+        self._hotness = None
+        self._recent_delta = None
+        self._known = None
+        self._ucn_streak = None
         self._cached_mask = None
         self._cached_n = 0

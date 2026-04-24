@@ -16,12 +16,17 @@ class AblationMode(IntEnum):
       BASE_ASIC    : descriptor capture overhead only; no optimisation active
       CONSOLIDATION: + Update-Stream Consolidation (gradient fold/suppress)
       LIVE_FABRIC  : + Incremental Live-State Fabric (hot/cold Gaussian tiers)
-      SALIENCE     : + Salience-First Render Issue (PROMOTE/FULL/SKIP filter)
+      CONV_GRADED  : + Convergence-Graded Splatting (Grade-A/B/D primitive
+                     dispatch driven by training-side S_i^(W) and
+                     current-view support-domain shrink).
+                     ``SALIENCE`` is kept as a backwards-compatible alias
+                     for external ablation runners that still pass ``3``.
     """
     BASE_ASIC     = 0
     CONSOLIDATION = 1
     LIVE_FABRIC   = 2
-    SALIENCE      = 3
+    CONV_GRADED   = 3
+    SALIENCE      = 3  # deprecated alias — same integer value as CONV_GRADED
 
 
 @dataclass
@@ -29,12 +34,12 @@ class ASICConfig:
     """All simulator knobs in one place.
 
     Passed to GLASSPipeline, ConsolidationUnit, LiveStateFabric, and
-    SalienceFirstIssue unchanged — each component reads only its own fields.
+    ConvergenceGrader unchanged — each component reads only its own fields.
     """
 
     # ── Ablation mode ─────────────────────────────────────────────────────────
     mode: int = AblationMode.BASE_ASIC
-    """0=base, 1=+consolidation, 2=+live_fabric, 3=+salience. May also be
+    """0=base, 1=+consolidation, 2=+live_fabric, 3=+CGS. May also be
     passed as an int; compared with >= so intermediate modes work correctly."""
 
     # ── Stage 1: Update-Stream Consolidation ─────────────────────────────────
@@ -196,6 +201,13 @@ class ASICConfig:
     At base_iters=150 this caps maximum suppression at (150-10)/150 ≈ 93%.
     Quality metrics are then measured under the actual reduced iteration count."""
 
+    adaptive_iter_suppression_cap: float = 0.85
+    """Maximum suppression ratio that may be converted into training-loop
+    early-exit.  UCN may still suppress more update bytes internally, but the
+    outer loop keeps at least 15% of the baseline iterations before applying
+    ``min_ntc_iters_floor``.  This prevents near-zero gradients in dense
+    render/backward baselines from collapsing the optimizer schedule."""
+
     min_delta_norm: float = 1e-5
     """Per-Gaussian gradient L2-norm below which the gradient is zeroed
     entirely (near-zero delta → nothing meaningful to propagate)."""
@@ -256,30 +268,129 @@ class ASICConfig:
     room to kick in, but high enough that a one-off suppression on a
     noisy frame does not evict a Gaussian from the hot tier."""
 
-    # ── Stage 4: Salience-First Render Issue ─────────────────────────────────
+    # ── Stage 4: Convergence-Graded Splatting (CGS) ──────────────────────────
+    # Support-domain CGS combines the training-side update energy
+    # S_i^(W) = (1/W) Σ ||Δθ||² with current-view graphics support:
+    #
+    #   kappa_i    = 1 - norm(S_i^(W))
+    #   P_i(v)     = sat(opacity * support_area * appearance_bound / P_ref)
+    #   rho_i(v)   = 1 - cgs_lambda * kappa_i * (1 - P_i(v))
+    #   Q_i^CGS(v) = rho_i(v) * Q_th,i
+    #
+    # Grade-A keeps the full path when rho remains close to 1.  Grade-D is
+    # filtered before tile expansion when the shrunk support area is below
+    # cgs_tau_d_area.  Everything else takes the Grade-B compact path.
+    grade_window: int = 6
+    """Length of the training-side frame/sample window W used to compute
+    S_i^(W).  Multiple optimizer steps inside one streaming frame are
+    accumulated into one window sample by ``ConvergenceGrader``."""
+
+    cgs_min_ready_samples: int = 3
+    """Minimum number of frame samples required before CGS can classify a
+    Gaussian from the available S_i^(W) history.  This keeps the paper-facing
+    window length at W while allowing short 10-frame ablations to use
+    partially filled, but already informative, convergence histories."""
+
+    cgs_lambda: float = 0.75
+    """Strength of training-aware support shrink.  0 disables CGS support
+    shrink; 1 allows fully converged and low-potential primitives to shrink
+    most aggressively."""
+
+    cgs_tau_a: float = 0.90
+    """Grade-A threshold on rho_i(v).  Values above this keep the full
+    SH3+fp32 path because the effective support remains close to the
+    standard 3DGS support."""
+
+    cgs_tau_d_area: float = 4.0
+    """Grade-D threshold on Omega_i^CGS(v), measured in screen pixels^2.
+    Primitives below this effective support area are filtered before tile
+    expansion."""
+
+    cgs_p_ref: float = 0.0
+    """Explicit render-potential normalizer.  <=0 uses the per-view
+    cgs_p_ref_quantile of opacity * support_area * appearance_bound."""
+
+    cgs_p_ref_quantile: float = 0.95
+    """Robust per-view normalizer for graphics render potential P_i(v)."""
+
+    cgs_update_ref_quantile: float = 0.90
+    """Robust normalizer for S_i^(W).  This avoids the old fixed percentile
+    grade assignment while preventing a single outlier from making every
+    Gaussian appear fully converged."""
+
+    cgs_update_ref_min: float = 1e-12
+    """Numerical floor for S_i^(W) normalization."""
+
+    grade_a_floor: float = 0.10
+    """Quality safeguard: minimum fraction of Gaussians that are always
+    classified Grade-A regardless of support-domain shrink.  Same
+    semantics (and default) as the legacy ``full_path_fraction``."""
+
+    # Compact-path design choices (principled, not magic).  The SH
+    # degree reduction drives colour-MAC savings, the fp byte scale
+    # drives state-read bandwidth savings; the combined per-primitive
+    # Compact:Full cycle ratio is derived on the fly by
+    # ``CycleAccumulator.compact_primitive_weight`` using these two
+    # knobs and the same EWA formulas as the Full path — no hardcoded
+    # "0.33" fudge factor anywhere in the accounting chain.
+    compact_sh_degree: int = 1
+    """SH degree used by the Grade-B Compact render path.  1 → only
+    L=0 + L=1 coefficients (4 per channel vs. SH3's 16), which matches
+    the narrative that Grade-B Gaussians contribute "stable background"
+    with little directional colour variation."""
+
+    compact_state_byte_scale: float = 0.5
+    """Per-primitive state byte scale on the Compact path.  0.5 reflects
+    fp32 → fp16 for the 11-dimensional geometry+opacity state and the
+    SH coefficients read by Phase 1 / Phase 3."""
+
+    contrib_ema_alpha: float = 0.80
+    """Deprecated.  The support-domain CGS implementation no longer uses a
+    contribution EMA, but the field is retained so older config dumps load."""
+
+    # ── Deprecated aliases (Salience-First Render Issue) ─────────────────────
+    # Kept so external runners / tests that still reference these names keep
+    # working; ConvergenceGrader itself reads only the new fields above.
     salience_ema_alpha: float = 0.80
-    """EMA decay for per-Gaussian salience scores."""
+    """Deprecated alias for ``contrib_ema_alpha``."""
 
-    promote_thresh: float = 0.55
-    """Salience score above which a Gaussian is PROMOTE (always rendered,
-    prioritised in tile queue)."""
+    promote_thresh: float = 0.85
+    """Deprecated legacy salience threshold."""
 
-    skip_thresh: float = 0.04
-    """Salience score below which a stable Gaussian is SKIP (excluded from
-    render call entirely)."""
+    skip_thresh: float = 0.30
+    """Deprecated legacy salience threshold."""
+
+    tau_stable: float = 0.40
+    """Deprecated legacy rank-proxy threshold."""
+
+    tau_wake: float = 0.85
+    """Deprecated legacy rank-proxy threshold."""
+
+    tau_hot: float = 0.80
+    """Deprecated legacy rank-proxy threshold."""
+
+    tau_dormant: float = 0.30
+    """Deprecated legacy rank-proxy threshold."""
 
     stability_window: int = 6
-    """Number of recent frames used to estimate salience variance for the
-    stability gate."""
+    """Deprecated alias for ``grade_window``."""
 
     stability_var_max: float = 0.01
-    """Maximum score variance for a Gaussian to be classified as 'stable'
-    (prerequisite for SKIP classification)."""
+    """Deprecated — CGS uses the S_i^(W) magnitude threshold
+    (``tau_stable``) instead of the per-Gaussian salience-score variance
+    gate.  Retained so existing config dumps still round-trip."""
 
     full_path_fraction: float = 0.10
-    """Minimum fraction of Gaussians that are always classified FULL regardless
-    of score. Quality safeguard: prevents over-pruning when score history is
-    stale or all scores are low."""
+    """Deprecated alias for ``grade_a_floor``."""
+
+    # ``compact_path_cost_ratio`` was briefly exposed during CGS bring-up
+    # as a single "0.33" fudge factor.  It has been replaced by the pair
+    # ``(compact_sh_degree, compact_state_byte_scale)`` above, both of
+    # which drive the ratio through the EWA cycle formulas at runtime
+    # (see :meth:`CycleAccumulator.compact_primitive_weight`).  The
+    # attribute is intentionally absent so that any code still reading
+    # it trips an ``AttributeError`` and gets routed to the derived
+    # helper; no silent magic number survives.
 
     # ── FPS measurement ───────────────────────────────────────────────────────
     fps_warmup: int = 5
@@ -305,9 +416,25 @@ class ASICConfig:
             raise ValueError(f"mode must be 0–3, got {self.mode}")
         if not 0.0 <= self.merge_cos_threshold <= 1.0:
             raise ValueError("merge_cos_threshold must be in [0, 1]")
+        if not 0.0 <= self.adaptive_iter_suppression_cap <= 1.0:
+            raise ValueError("adaptive_iter_suppression_cap must be in [0, 1]")
         if not 0.0 < self.hotness_alpha < 1.0:
             raise ValueError("hotness_alpha must be in (0, 1)")
         if not 0.0 < self.salience_ema_alpha < 1.0:
             raise ValueError("salience_ema_alpha must be in (0, 1)")
         if not 0.0 < self.full_path_fraction <= 1.0:
             raise ValueError("full_path_fraction must be in (0, 1]")
+        if not 0.0 <= self.grade_a_floor <= 1.0:
+            raise ValueError("grade_a_floor must be in [0, 1]")
+        if not 0.0 <= self.cgs_lambda <= 1.0:
+            raise ValueError("cgs_lambda must be in [0, 1]")
+        if not 0.0 <= self.cgs_tau_a <= 1.0:
+            raise ValueError("cgs_tau_a must be in [0, 1]")
+        if self.cgs_tau_d_area < 0.0:
+            raise ValueError("cgs_tau_d_area must be non-negative")
+        if not 0.0 <= self.cgs_p_ref_quantile <= 1.0:
+            raise ValueError("cgs_p_ref_quantile must be in [0, 1]")
+        if not 0.0 <= self.cgs_update_ref_quantile <= 1.0:
+            raise ValueError("cgs_update_ref_quantile must be in [0, 1]")
+        if self.cgs_min_ready_samples < 1:
+            raise ValueError("cgs_min_ready_samples must be >= 1")
