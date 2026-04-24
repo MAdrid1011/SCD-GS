@@ -1,0 +1,119 @@
+diff --git a/scene/gaussian_model.py b/scene/gaussian_model.py
+index 4dc2668..dd48fd7 100644
+--- a/scene/gaussian_model.py
++++ b/scene/gaussian_model.py
+@@ -1393,6 +1393,27 @@ class GaussianModel:
+             print(f"GaussianModel::load_ply(): initialized Gaussian attributes from: {path}")
+ 
+ 
++    def init_prev_atts_from_current(self):
++        """Populate prev_atts and prev_latents from the currently loaded attributes.
++
++        Called after load_ply when starting incremental training from a
++        pre-trained frame-1 init model (start_frame_idx=2), so that gate
++        modulation and temporal-residual encoding have a valid Frame-1
++        reference on the very first incremental frame.
++
++        Without this call, prev_atts / prev_latents are all-None after
++        load_ply, causing both gate bypass and densification_postfix crashes.
++        """
++        with torch.no_grad():
++            for att_name in self.get_atts:
++                decoded = self.latent_decoders[att_name](self._latents[att_name])
++                self.prev_atts[att_name] = decoded.clone().requires_grad_(False)
++                self.prev_atts_initial[att_name] = decoded.clone().requires_grad_(False)
++                # prev_latents mirrors _latents (raw quantised codes) and is used
++                # by densification_postfix to clone/split latent tensors.  Normally
++                # set at the end of each frame; here we seed it from the init model.
++                self.prev_latents[att_name] = self._latents[att_name].clone().requires_grad_(False)
++
+     def replace_tensor_to_optimizer(self, tensor, name, lr=None):
+         optimizable_tensors = {}
+         assert "ldec" not in name, "Latent decoder params cannot be replaced!"
+diff --git a/train.py b/train.py
+index 5726e64..671e100 100644
+--- a/train.py
++++ b/train.py
+@@ -134,9 +134,10 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
+     scene = Scene(
+         dataset,
+         gaussians,
+-        train_image_data= train_image_data,
++        train_image_data=train_image_data,
+         test_image_data=test_image_data,
+-        N_video_views=max_frames
++        load_iteration=getattr(args, "load_iteration", None),
++        N_video_views=max_frames,
+     )
+     # Setup training arguments
+     gaussians.training_setup(opt)
+@@ -203,7 +204,44 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
+                                         end=1.0,
+                                         )
+ 
+-    start_frame_idx = 1
++    start_frame_idx = getattr(args, "start_frame_idx", 1)
++
++    # When starting from a pre-trained init model (start_frame_idx > 1):
++    #   1. Populate prev_atts so gate modulation has a valid Frame-1 reference.
++    #   2. Advance the train_loader so cur_frame_views points to the correct
++    #      frame and prev_frame_views holds the immediately preceding frame.
++    #
++    # The initial next(train_loader) call above already consumed frame 1's
++    # batch into cur_frame_views.  For start_frame_idx=2 we need:
++    #   prev_frame_views = frame-1 images  (already in cur_frame_views)
++    #   cur_frame_views  = frame-2 images  (next batch from loader)
++    if start_frame_idx > 1:
++        if scene.loaded_iter is None:
++            raise ValueError(
++                f"start_frame_idx={start_frame_idx} requires a pre-loaded model "
++                "(pass load_iteration to Scene). No loaded_iter found."
++            )
++        gaussians.init_prev_atts_from_current()
++        # cur_frame_views currently holds frame-1 images; keep as prev.
++        prev_frame_views = cur_frame_views
++        # Advance loader to frame start_frame_idx (consume frames 2 … start_frame_idx).
++        for skip in range(start_frame_idx - 1):
++            skip_data = next(train_loader)
++            skip_images, skip_paths = skip_data[0].cuda(), skip_data[1]
++        cur_frame_views = skip_images
++        cur_train_images, cur_train_paths = skip_images, skip_paths
++        # Initialise gt_image shape so the viewspace_diff gate-init block at the
++        # start of frame 2 can use gt_image.shape without hitting UnboundLocalError.
++        # (Normally gt_image is set inside the frame-1 inner training loop which
++        #  we are skipping here.)
++        gt_image = cur_frame_views[0]
++        # Note: the test_loader was already advanced once during initialisation
++        # (the first next(test_loader) call above), so it is already at position
++        # start_frame_idx and no further advance is needed.
++        print(f"training(): start_frame_idx={start_frame_idx}, "
++              f"advanced train_loader by {start_frame_idx - 1} frame(s), "
++              f"prev_atts populated from init model.")
++
+     training_metrics = []
+     net_elapsed_time = 0.0
+     net_iter_time = 0.0
+@@ -1256,6 +1294,10 @@ if __name__ == "__main__":
+     parser.add_argument("--quiet", action="store_true")
+     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
+     parser.add_argument("--start_checkpoint", type=str, default = None)
++    parser.add_argument("--start_frame_idx", type=int, default=1,
++                        help="First frame index to train. When >1 the model must be "
++                             "pre-loaded via load_iteration and the data loader is "
++                             "advanced so frame (start_frame_idx-1) becomes prev_frame.")
+     parser.add_argument('--use_xyz_legacy', action='store_true', default=False, help='If set, use legacy xyz decoding in GaussianModel (_xyz_legacy) to reproduce paper numbers. To save compressed pkl\'s, leave unset or set to False. Default: False (use _xyz_fixed).')
+     args = parser.parse_args(sys.argv[1:])
+     # args.save_iterations.append(args.iterations)
+diff --git a/utils/loader_utils.py b/utils/loader_utils.py
+index 88aefa2..fbf4f36 100644
+--- a/utils/loader_utils.py
++++ b/utils/loader_utils.py
+@@ -22,7 +22,7 @@ class MultiViewVideoDataset(Dataset):
+         verbose=False,
+     ):
+         videos = glob.glob(os.path.join(datadir, "cam*"))
+-        videos = sorted(videos)
++        videos = sorted(v for v in videos if os.path.isdir(v))
+         self.n_cams = 0
+         self.n_frames = None
+         self.image_transform = transforms.ToTensor()

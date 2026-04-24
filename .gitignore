@@ -72,6 +72,12 @@ Generated_image*.png
 baselines/**/build/
 baselines/**/*.egg-info/
 
-# Exported patches (if produced locally).
+# Exported patches are ignored by default, except reproducible baseline patches.
 patches/
 *.patch
+!patches/
+!patches/baselines/
+!patches/baselines/*.patch
+
+# Local scratch notes with raw measurement tables (kept out of VCS).
+GLASS_Data.md
