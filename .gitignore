@@ -1,0 +1,71 @@
+# ─── OS / Editor ──────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+.metals/
+.bloop/
+.bsp/
+
+# ─── Python ───────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.ipynb_checkpoints/
+
+# ─── Virtual environments ─────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ─── Build artifacts ──────────────────────────────────────────────────
+build/
+dist/
+wheels/
+*.manifest
+*.spec
+
+# ─── Logs / temp ──────────────────────────────────────────────────────
+*.log
+logs/
+*.tmp
+*.bak
+*.orig
+
+# Private paper materials retained only in the local workspace.
+/hpca2027-latex-template/
+/GCC.pdf
+/REACT3D.pdf
+
+# Local research inputs and experimental outputs are not part of the public
+# mechanism artifact.
+/data/
+/results/
+/output/
+/outputs/
+*.ckpt
+*.pth
+*.pt
+*.ply
+*.splat
+/runs/
+/wandb/
+events.out.tfevents.*
+
+# Generated or local-only implementation artifacts.
+/rtl/verilog/
+/out/
+rtl/project/.boot/
+rtl/project/.sbtboot/

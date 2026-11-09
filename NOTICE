@@ -1,0 +1,5 @@
+SCD-GS is licensed under the Apache License, Version 2.0.
+
+This repository includes Berkeley HardFloat under rtl/vendor/berkeley-hardfloat.
+Berkeley HardFloat is licensed under the BSD 3-Clause License. Its complete
+license text is retained at rtl/vendor/berkeley-hardfloat/LICENSE.
